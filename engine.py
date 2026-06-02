@@ -38,6 +38,8 @@ os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 # The 10 highly liquid Bursa Malaysia stocks.
 # Selected on the basis of high average daily trade volume.
 # Section 3.4 of the methodology.
+# The 10 highly liquid Bursa Malaysia stocks.
+# Mapped using numeric stock codes for universal yfinance API stability.
 BURSA_10 = {
     "Maybank":            "1155.KL",
     "Public Bank":        "1295.KL",
@@ -48,7 +50,7 @@ BURSA_10 = {
     "Maxis Berhad":       "6012.KL",
     "Axiata Group":       "6888.KL",
     "Genting Berhad":     "3182.KL",
-    "KL Kepong":    "2445.KL",
+    "KL Kepong":          "2445.KL",
 }
 
 def fetch_data(symbol: str, period: str = "5y") -> pd.DataFrame:
@@ -196,3 +198,41 @@ class StockPreprocessor:
         scaled = self.scaler.transform(row)
         return np.clip(scaled, 0.0, 1.0)
     
+if __name__ == "__main__":
+    # Dual-format mapping to handle Yahoo API routing instability
+    TICKER_LOOKUP = {
+        "Maybank":            ["1155.KL", "MAYBANK.KL"],
+        "Public Bank":        ["1295.KL", "PBBANK.KL"],
+        "CIMB Group":         ["1023.KL", "CIMB.KL"],
+        "TNB":                ["5347.KL", "TENAGA.KL"],
+        "Petronas Chemicals": ["5183.KL", "PCHEM.KL"],
+        "IHH Healthcare":     ["5225.KL", "IHH.KL"],
+        "Maxis Berhad":       ["6012.KL", "MAXIS.KL"],
+        "Axiata Group":       ["6888.KL", "AXIATA.KL"],
+        "Genting Berhad":     ["3182.KL", "GENTING.KL"],
+        "KL Kepong":          ["2445.KL", "KLK.KL"],
+    }
+
+    for stock_name, tickers in TICKER_LOOKUP.items():
+        print(f"Exporting {stock_name}...")
+        success = False
+        
+        for ticker in tickers:
+            try:
+                # Attempt to download using the current ticker format
+                df_raw = fetch_data(ticker, period="5y")
+                df_features = add_features(df_raw)
+                
+                filename = f"{stock_name.lower().replace(' ', '_')}_5y.csv"
+                df_features.to_csv(filename)
+                print(f" -> Saved successfully using symbol [{ticker}] as: {filename}")
+                success = True
+                break  # Exit the ticker fallback loop if successful
+                
+            except Exception:
+                continue  # Try the alternative ticker format
+                
+        if not success:
+            print(f" -> Failed to fetch {stock_name} using all known Yahoo symbols.")
+
+
