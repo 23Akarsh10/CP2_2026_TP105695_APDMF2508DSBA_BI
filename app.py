@@ -1,180 +1,267 @@
 """
-app.py  —  Stock Predictor  (Upgraded)
-========================================
-Streamlit dashboard wired to the upgraded engine.py.
+app.py — Stock Predictor Dashboard
+====================================
+Streamlit dashboard for the Bursa Malaysia Stock Decision Support System.
 
-New panels vs original
------------------------
-+ 5-Day Forecast panel with Plotly chart
-+ Sharpe Ratio in leaderboard
-+ Stop-Loss Advisory card
-+ Per-headline sentiment table
-+ Ensemble sentiment score
-+ Portfolio Ranking tab (all 10 stocks)
-+ Risk disclaimer footer
+Wired against the review-hardened engine.py:
+  - walk_forward_validation(df, proc, ...) takes the feature-engineered
+    DataFrame, not pre-scaled (X, y) arrays — fixes data leakage.
+  - 13 technical features instead of 6 (Returns, EMA20, Bollinger Bands,
+    Volatility, ATR, Volume added).
+  - Sentiment comes from the local Ollama/Llama 3 agent
+    (run_sentiment_agent) instead of VADER/TextBlob.
+  - ChampionForecaster.fit() takes raw_df (not symbol=) and no longer
+    persists to disk — model_cache logic removed to match engine.py.
+
+Layout:
+  Sidebar      : stock selector + CRISP-DM tracker + stop-loss slider
+  Main Tab 1   : Market Overview table (all 10 stocks at a glance)
+  Main Tab 2   : Stock Deep Dive (projected vs actual chart + model info)
 """
 
 import os
+import warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+warnings.filterwarnings("ignore")
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
 from engine import (
-    fetch_data, add_features, StockPreprocessor,
-    walk_forward_validation, benchmark_sentiment,
-    ChampionForecaster, stop_loss_advisory, build_ranking_table,
+    fetch_data,
+    add_features,
+    StockPreprocessor,
+    walk_forward_validation,
+    ChampionForecaster,
+    run_sentiment_agent,
+    stop_loss_advisory,
+    get_current_session_label,
 )
 
 # ═══════════════════════════════════════════════════════════════════
-# CONFIG
+# STOCK UNIVERSE
 # ═══════════════════════════════════════════════════════════════════
+# 10 highly liquid Bursa Malaysia stocks. Keys are display names used
+# throughout the dashboard and passed to run_sentiment_agent() as the
+# company_name for headline matching; values are Yahoo Finance tickers.
 
 BURSA_10 = {
     "Maybank":            "1155.KL",
-    "Public Bank":        "1295.KL",
-    "CIMB Group":         "1023.KL",
-    "TNB":                "5347.KL",
-    "Petronas Chemicals": "5183.KL",
-    "IHH Healthcare":     "5225.KL",
-    "Press Metal":        "8869.KL",
-    "CelcomDigi":         "6947.KL",
-    "MISC":               "3816.KL",
-    "Hong Leong Bank":    "5819.KL",
+    "CIMB":                "1023.KL",
+    "Public Bank":         "1295.KL",
+    "TNB":                 "5347.KL",
+    "Petronas Chemicals":  "5183.KL",
+    "Maxis":               "6012.KL",
+    "Axiata":              "6888.KL",
+    "Genting":             "3182.KL",
+    "KL Kepong":           "2445.KL",
+    "IHH Healthcare":      "5225.KL",
 }
 
-MODEL_COLOURS = {
-    "XGBoost": "#3b82f6",
-    "LSTM":    "#f59e0b",
-    "GRU":     "#8b5cf6",
-}
 
-SENTIMENT_COLOURS = {
-    "Positive": "#10b981",
-    "Neutral":  "#9ca3af",
-    "Negative": "#ef4444",
-}
+# ═══════════════════════════════════════════════════════════════════
+# PAGE CONFIG
+# ═══════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="Stock Predictor", layout="wide", page_icon="📈")
+st.set_page_config(
+    page_title="Stock Predictor",
+    layout="wide",
+    page_icon="📈",
+)
 
-# ── Dark theme CSS ───────────────────────────────────────────────────────────
 st.markdown("""
 <style>
     .main { background-color: #0e1117; }
-    .stMetric {
-        background-color: #1a1c24;
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #2d2f39;
-    }
     div[data-testid="stSidebar"] {
         background-color: #0e1117;
         border-right: 1px solid #2d2f39;
     }
-    .forecast-card {
+    .metric-card {
         background: #1a1c24;
         border: 1px solid #2d2f39;
         border-radius: 10px;
-        padding: 12px 16px;
-        text-align: center;
-    }
-    .advisory-box {
-        background: #1a1c24;
-        border-left: 4px solid #f59e0b;
-        border-radius: 6px;
-        padding: 14px 18px;
-        margin-top: 8px;
-        font-size: 0.95em;
+        padding: 16px 20px;
+        margin-bottom: 10px;
     }
     .disclaimer {
         color: #6b7280;
         font-size: 0.78em;
         border-top: 1px solid #2d2f39;
         padding-top: 12px;
-        margin-top: 30px;
-    }
-    .sentiment-badge {
-        display: inline-block;
-        padding: 3px 12px;
-        border-radius: 12px;
-        font-size: 0.82em;
-        font-weight: 600;
+        margin-top: 24px;
     }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CACHING
+# HELPERS
 # ═══════════════════════════════════════════════════════════════════
 
+SENTIMENT_COLOUR = {
+    "Positive": "#10b981",
+    "Neutral":  "#9ca3af",
+    "Negative": "#ef4444",
+}
+
+ACTION_COLOUR = {
+    "Buy":  "#10b981",
+    "Sell": "#ef4444",
+    "Hold": "#f59e0b",
+}
+
+
+def _suggested_action(exp_return: float, sentiment: str,
+                       stop_breached: bool) -> str:
+    """
+    Derives a suggested action from three signals:
+      - Expected 5-day return (quantitative)
+      - Sentiment label (qualitative, from the local Llama 3 agent)
+      - Stop-loss breach flag (risk management)
+
+    Rules:
+      If stop-loss is breached                        → Sell
+      If return > 1% and sentiment is Positive        → Buy
+      If return < -1% or sentiment is Negative        → Sell
+      Otherwise                                        → Hold
+    """
+    if stop_breached:
+        return "Sell"
+    if exp_return > 1.0 and sentiment == "Positive":
+        return "Buy"
+    if exp_return < -1.0 or sentiment == "Negative":
+        return "Sell"
+    return "Hold"
+
+
+def _trend_label(exp_return: float) -> str:
+    """Bullish if expected return is positive, Bearish if negative."""
+    return "Bullish 📈" if exp_return >= 0 else "Bearish 📉"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CACHING
+# ═══════════════════════════════════════════════════════════════════
+# Cache keys include the current session label (morning / half_day /
+# end_of_day) from engine.get_current_session_label(), so results only
+# recompute once per checkpoint — like a scoreboard updating at
+# half-time and full-time rather than on every page interaction.
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_load(symbol: str):
+def load_stock_data(symbol: str, session_label: str):
+    """Downloads and feature-engineers data for one stock."""
     df = fetch_data(symbol)
     df = add_features(df)
     return df
 
 
 @st.cache_resource(show_spinner=False)
-def cached_tournament(symbol: str, _df):
+def run_engine(symbol: str, session_label: str, _df):
     """
-    Runs walk-forward tournament for all 3 models, selects champion,
-    trains ChampionForecaster on full data, returns everything.
-    """
-    proc             = StockPreprocessor()
-    X, y, scaled     = proc.prepare_data(_df)
-    results          = {}
+    Runs the full quantitative engine for one stock:
+      1. Builds a StockPreprocessor
+      2. Runs leakage-free walk-forward validation for all 3 base models
+      3. Selects champion (lowest MAE)
+      4. Retrains champion on full data
+      5. Generates 5-day forecast with full indicator recomputation
+    Returns everything needed for the dashboard.
 
+    Note: walk_forward_validation() takes the feature-engineered
+    DataFrame directly (not pre-scaled X, y) — it fits a fresh scaler
+    per fold internally to avoid data leakage.
+    """
+    proc = StockPreprocessor()
+
+    # Walk-forward validation for the three base architectures
+    results = {}
     for mtype in ["XGBoost", "LSTM", "GRU"]:
-        res = walk_forward_validation(X, y, model_type=mtype, n_splits=5)
-        res["actuals_rm"] = proc.inverse_transform(res["actuals"])
-        res["preds_rm"]   = proc.inverse_transform(res["predictions"])
-        results[mtype]    = res
+        res = walk_forward_validation(_df, proc, model_type=mtype, n_splits=5)
+        results[mtype] = res
 
     # Champion = lowest MAE
     champion = min(results, key=lambda k: results[k]["avg_mae"])
 
-    # Retrain champion on full data & forecast 5 days
-    fc = ChampionForecaster(proc, epochs=15)
-    fc.fit(X, y, scaled, champion)
-    forecast_5 = fc.forecast(n_days=5)
+    # Retrain champion on full data and forecast 5 days.
+    # ChampionForecaster.fit() needs a freshly-prepared (X, y, scaled)
+    # from the SAME preprocessor instance used above, fit on all data —
+    # this is the one place prepare_data() (fit-on-all) is correct to use.
+    X, y, scaled = proc.prepare_data(_df)
+    champ = ChampionForecaster(proc)
+    champ.fit(X, y, scaled, champion, raw_df=_df)
+    forecast_5 = champ.forecast(n_days=5)
 
     return results, champion, forecast_5, proc
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def cached_sentiment(symbol: str):
-    return benchmark_sentiment(symbol)
+def load_sentiment(symbol: str, company_name: str, session_label: str):
+    """
+    Runs the local AI sentiment agent (Ollama + Llama 3) for one stock.
+    Falls back to a documented Neutral response if no headlines are
+    found or Ollama is unreachable — see engine.run_sentiment_agent().
+    """
+    return run_sentiment_agent(symbol, company_name)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PORTFOLIO RANKING  (all 10 stocks, cached separately)
+# BUILD MARKET OVERVIEW ROW FOR ONE STOCK
 # ═══════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def cached_ranking():
-    summaries = {}
-    for name, sym in BURSA_10.items():
-        try:
-            df               = cached_load(sym)
-            results, champ, fc5, proc = cached_tournament(sym, df)
-            sent             = cached_sentiment(sym)
-            last_close       = float(df["Close"].iloc[-1])
-            best             = results[champ]
-            summaries[name]  = {
-                "last_close":      last_close,
-                "forecast":        fc5,
-                "champion":        champ,
-                "mae":             best["avg_mae"],
-                "da":              best["avg_acc"],
-                "sharpe":          best["avg_sharpe"],
-                "sentiment_label": sent["E_Label"],
-            }
-        except Exception:
-            pass    # skip failed tickers silently
-    return build_ranking_table(summaries)
+def build_stock_row(idx: int, name: str, symbol: str,
+                    session_label: str) -> dict | None:
+    """
+    Runs the full pipeline for one stock and returns a dict
+    with all columns needed for the Market Overview table.
+    Returns None if data cannot be fetched.
+    """
+    try:
+        df = load_stock_data(symbol, session_label)
+        results, champion, fc5, proc = run_engine(symbol, session_label, df)
+        sentiment = load_sentiment(symbol, name, session_label)
+
+        last_close = float(df["Close"].iloc[-1])
+        exp_return = (float(fc5[-1]) - last_close) / last_close * 100
+        sl_info    = stop_loss_advisory(last_close, fc5, 0.05)
+        trend      = _trend_label(exp_return)
+        sent_label = sentiment["sentiment_label"]
+        action     = _suggested_action(
+                         exp_return, sent_label, sl_info["breached"])
+        best       = results[champion]
+
+        return {
+            "No.":              idx,
+            "Stock":            name,
+            "Last Close (RM)":  round(last_close, 4),
+            "Expected Return":  round(exp_return, 2),
+            "Trend":            trend,
+            "Sentiment":        sent_label,
+            "Sentiment Reason": sentiment["qualitative_rationale"],
+            "Suggested Action": action,
+            # Hidden — used in deep dive tab
+            "_symbol":          symbol,
+            "_forecast":        fc5,
+            "_champion":        champion,
+            "_mae":             round(best["avg_mae"],    4),
+            "_da":              round(best["avg_acc"]*100, 1),
+            "_actuals_rm":      best["actuals_rm"],
+            "_preds_rm":        best["predictions_rm"],
+            "_sl_threshold":    sl_info["threshold"],
+            "_sl_breached":     sl_info["breached"],
+            "_sl_advisory":     sl_info["advisory"],
+            "_df":              df,
+        }
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SESSION CHECKPOINT
+# ═══════════════════════════════════════════════════════════════════
+
+session_label = get_current_session_label()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -183,11 +270,12 @@ def cached_ranking():
 
 st.sidebar.title("📈 Stock Predictor")
 st.sidebar.markdown("---")
-
-selected_name  = st.sidebar.selectbox("Select Bursa Corporate Ticker",
-                                       list(BURSA_10.keys()))
-ticker_symbol  = BURSA_10[selected_name]
-stop_loss_pct  = st.sidebar.slider("Stop-Loss Threshold (%)", 1, 15, 5) / 100
+selected_name = st.sidebar.selectbox(
+    "Select stock for deep dive",
+    list(BURSA_10.keys()),
+)
+stop_loss_pct = st.sidebar.slider(
+    "Stop-Loss Threshold (%)", 1, 15, 5) / 100
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("CRISP-DM Cycle")
@@ -197,301 +285,264 @@ st.sidebar.success("✅ Data Preparation")
 st.sidebar.warning("⏳ Modelling (Active)")
 st.sidebar.info("⏳ Evaluation")
 st.sidebar.info("⏳ Deployment")
-
 st.sidebar.markdown("---")
-st.sidebar.caption("Data sourced from Yahoo Finance via yfinance.\n"
-                   "For educational / research use only.")
+
+session_caption = {
+    "morning":    "🌅 Session: Morning (pre 1:00 PM)",
+    "half_day":   "🕐 Session: Half-Day (1:00–5:00 PM)",
+    "end_of_day": "🌆 Session: End-of-Day (post 5:00 PM)",
+}
+st.sidebar.caption(session_caption.get(session_label, session_label))
+st.sidebar.caption(
+    "Data sourced from Yahoo Finance. Sentiment generated locally via "
+    "Ollama + Llama 3. For research and educational use only.")
 
 
 # ═══════════════════════════════════════════════════════════════════
 # TABS
 # ═══════════════════════════════════════════════════════════════════
 
-tab_stock, tab_rank = st.tabs(
-    [f"📊 {selected_name} Analysis", "🏆 Portfolio Ranking"]
-)
+tab_overview, tab_dive = st.tabs([
+    "📊 Market Overview",
+    f"🔍 {selected_name} — Deep Dive",
+])
 
 
 # ───────────────────────────────────────────────────────────────────
-# TAB 1 — INDIVIDUAL STOCK ANALYSIS
+# TAB 1 — MARKET OVERVIEW TABLE
 # ───────────────────────────────────────────────────────────────────
-with tab_stock:
+with tab_overview:
 
-    st.header(f"Stock Predictor — {selected_name} ({ticker_symbol})")
+    st.header("Market Overview — Bursa Malaysia Top 10")
+    st.caption(
+        "All 10 stocks processed through the quantitative engine. "
+        "Champion model selected per stock by lowest walk-forward MAE "
+        "(leakage-free, per-fold scaling). Sentiment and its reason are "
+        "generated locally by a Llama 3 agent reading live news and "
+        "macro indicators. Suggested action combines forecast "
+        "direction, sentiment, and stop-loss signal. Results refresh "
+        "once per session checkpoint (morning / half-day / end-of-day).")
 
-    # ── Load data ────────────────────────────────────────────────────
-    with st.spinner(f"Downloading & processing {selected_name} …"):
-        df = cached_load(ticker_symbol)
+    rows        = []
+    stock_cache = {}
 
-    with st.spinner("Running Model Tournament (LSTM · GRU · XGBoost) …"):
-        results, champion, forecast_5, proc = cached_tournament(
-            ticker_symbol, df)
+    progress = st.progress(0, text="Loading market data...")
+    for i, (name, symbol) in enumerate(BURSA_10.items()):
+        progress.progress(
+            (i + 1) / len(BURSA_10),
+            text=f"Processing {name}...")
+        row = build_stock_row(i + 1, name, symbol, session_label)
+        if row:
+            stock_cache[name] = row
+            rows.append({
+                "Sl. No.":           row["No."],
+                "Stock Name":        row["Stock"],
+                "Expected Return %": row["Expected Return"],
+                "Trend":             row["Trend"],
+                "Sentiment":         row["Sentiment"],
+                "Sentiment Reason":  row["Sentiment Reason"],
+                "Suggested Action":  row["Suggested Action"],
+            })
+    progress.empty()
 
-    with st.spinner("Fetching live news & analysing sentiment …"):
-        sentiment = cached_sentiment(ticker_symbol)
+    if rows:
+        overview_df = pd.DataFrame(rows).set_index("Sl. No.")
 
-    last_price = float(df["Close"].iloc[-1])
-    best_res   = results[champion]
-    sl_info    = stop_loss_advisory(last_price, forecast_5, stop_loss_pct)
-
-    # ── Row 1: Key metrics ───────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Latest Price", f"RM {last_price:.4f}")
-    with c2:
-        st.metric("Tournament Winner", champion,
-                  f"MAE: {best_res['avg_mae']:.4f}")
-    with c3:
-        dir_acc = best_res["avg_acc"] * 100
-        st.metric("Directional Accuracy", f"{dir_acc:.1f}%")
-    with c4:
-        st.metric("Sharpe Ratio", f"{best_res['avg_sharpe']:.3f}")
-
-    st.markdown("---")
-
-    # ── Row 2: Leaderboard ───────────────────────────────────────────
-    st.subheader("📊 Model Performance Benchmark (Walk-Forward Validation)")
-    lb_rows = []
-    for mtype, res in results.items():
-        flag = " 🏆" if mtype == champion else ""
-        lb_rows.append({
-            "Model":                  mtype + flag,
-            "Mean Absolute Error":    f"{res['avg_mae']:.4f}",
-            "Directional Acc (%)":    f"{res['avg_acc']*100:.2f}%",
-            "Sharpe Ratio":           f"{res['avg_sharpe']:.3f}",
-        })
-    st.table(pd.DataFrame(lb_rows))
-
-    st.markdown("---")
-
-    # ── Row 3: Backtest chart ────────────────────────────────────────
-    st.subheader("📈 Backtest Tracker: Actual vs Predictions")
-    fig_bt = go.Figure()
-
-    actuals_rm = results["LSTM"]["actuals_rm"]    # same for all models
-    fig_bt.add_trace(go.Scatter(
-        y=actuals_rm, name="Actual Market Price",
-        line=dict(color="#10b981", width=3)))
-
-    for mtype, res in results.items():
-        fig_bt.add_trace(go.Scatter(
-            y=res["preds_rm"], name=f"{mtype} Prediction",
-            line=dict(color=MODEL_COLOURS[mtype], dash="dot")))
-
-    fig_bt.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        height=420, margin=dict(l=0, r=0, t=20, b=0),
-        xaxis_title="Validation Steps", yaxis_title="Price (RM)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-    )
-    st.plotly_chart(fig_bt, use_container_width=True)
-
-    st.markdown("---")
-
-    # ── Row 4: 5-Day Forecast ────────────────────────────────────────
-    st.subheader(f"🔭 5-Day Price Forecast  —  Champion: {champion}")
-
-    day_cols = st.columns(5)
-    for i, (col, price) in enumerate(zip(day_cols, forecast_5)):
-        delta     = price - last_price
-        delta_pct = delta / last_price * 100
-        arrow     = "▲" if delta >= 0 else "▼"
-        colour    = "#10b981" if delta >= 0 else "#ef4444"
-        col.markdown(
-            f"<div class='forecast-card'>"
-            f"<div style='color:#9ca3af;font-size:0.8em'>Day {i+1}</div>"
-            f"<div style='font-size:1.25em;font-weight:700'>RM {price:.4f}</div>"
-            f"<div style='color:{colour};font-size:0.85em'>"
-            f"{arrow} {delta_pct:+.2f}%</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-    # Forecast line chart
-    st.markdown("")
-    hist_window = df["Close"].iloc[-30:].values
-    x_hist      = list(range(len(hist_window)))
-    x_fc        = list(range(len(hist_window) - 1,
-                             len(hist_window) - 1 + len(forecast_5) + 1))
-    fc_y        = np.concatenate([[hist_window[-1]], forecast_5])
-
-    fig_fc = go.Figure()
-    fig_fc.add_trace(go.Scatter(
-        x=x_hist, y=hist_window,
-        name="Last 30 Days", line=dict(color="#10b981", width=2)))
-    fig_fc.add_trace(go.Scatter(
-        x=x_fc, y=fc_y,
-        name="5-Day Forecast", line=dict(color="#f59e0b", width=2, dash="dot"),
-        mode="lines+markers", marker=dict(size=6)))
-    fig_fc.add_vline(x=len(hist_window) - 1,
-                     line_dash="dash", line_color="#6b7280",
-                     annotation_text="Today", annotation_position="top")
-    fig_fc.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        height=300, margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_title="Trading Days", yaxis_title="Price (RM)",
-    )
-    st.plotly_chart(fig_fc, use_container_width=True)
-
-    st.markdown("---")
-
-    # ── Row 5: Stop-Loss Advisory ────────────────────────────────────
-    st.subheader(f"🛡️ Stop-Loss Advisory  ({stop_loss_pct*100:.0f}% threshold)")
-
-    sl_col1, sl_col2, sl_col3 = st.columns(3)
-    sl_col1.metric("Entry Price",     f"RM {last_price:.4f}")
-    sl_col2.metric("Stop-Loss Level", f"RM {sl_info['threshold']:.4f}",
-                   f"-{stop_loss_pct*100:.0f}%")
-    peak_fc  = float(np.max(forecast_5))
-    exp_ret  = (peak_fc - last_price) / last_price * 100
-    sl_col3.metric("Peak 5-Day Forecast", f"RM {peak_fc:.4f}",
-                   f"{exp_ret:+.2f}%")
-
-    advisory_colour = "#ef4444" if sl_info["breached"] else "#10b981"
-    st.markdown(
-        f"<div class='advisory-box' style='border-left-color:{advisory_colour}'>"
-        f"{sl_info['advisory']}</div>",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("---")
-
-    # ── Row 6: Sentiment ─────────────────────────────────────────────
-    st.subheader("🧠 Sentiment Analysis: VADER vs TextBlob")
-
-    sc1, sc2, sc3 = st.columns(3)
-    for col, label, score, engine_lbl in [
-        (sc1, sentiment["V_Label"], sentiment["VADER"],    "VADER"),
-        (sc2, sentiment["T_Label"], sentiment["TextBlob"], "TextBlob"),
-        (sc3, sentiment["E_Label"], sentiment["Ensemble"], "Ensemble"),
-    ]:
-        badge_col = SENTIMENT_COLOURS.get(label, "#9ca3af")
-        col.markdown(
-            f"**{engine_lbl}** &nbsp;"
-            f"<span class='sentiment-badge' "
-            f"style='background:{badge_col};color:white'>{label}</span>",
-            unsafe_allow_html=True,
-        )
-        col.progress(max(0.0, min(1.0, (score + 1) / 2)))
-        col.caption(f"Score: {score:+.4f}")
-
-    # Per-headline breakdown
-    if sentiment["headlines"]:
-        with st.expander(f"📰 Headline Breakdown  ({sentiment['n']} articles)"):
-            hl_rows = []
-            for h in sentiment["headlines"]:
-                badge_col = SENTIMENT_COLOURS.get(h["label"], "#9ca3af")
-                hl_rows.append({
-                    "Headline":  h["title"][:90] + ("…" if len(h["title"]) > 90 else ""),
-                    "VADER":     h["vader"],
-                    "TextBlob":  h["textblob"],
-                    "Avg":       h["avg"],
-                    "Label":     h["label"],
-                })
-            st.dataframe(
-                pd.DataFrame(hl_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-    else:
-        st.caption("No recent headlines found for this ticker.")
-
-    # Risk cross-check callout
-    if (sentiment["E_Label"] == "Negative"
-            and exp_ret > 0
-            and not sl_info["breached"]):
-        st.warning(
-            "⚡ **Signal conflict detected:** The model forecasts a price rise, "
-            "but current news sentiment is Negative. Treat this trade with extra caution.")
-
-    # ── Footer ───────────────────────────────────────────────────────
-    st.markdown(
-        "<div class='disclaimer'>"
-        "⚠️ <strong>Disclaimer:</strong> Stock Predictor is a research and "
-        "educational Decision Support System. It does <strong>not</strong> "
-        "constitute financial advice. All forecasts carry uncertainty. "
-        "Past model performance is not indicative of future results. "
-        "Always conduct independent due diligence before investing."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-
-# ───────────────────────────────────────────────────────────────────
-# TAB 2 — PORTFOLIO RANKING
-# ───────────────────────────────────────────────────────────────────
-with tab_rank:
-
-    st.header("🏆 Portfolio Ranking — All 10 Bursa Stocks")
-    st.caption("Ranked by expected 5-day return. "
-               "Results cached for 1 hour; first load may take a few minutes.")
-
-    with st.spinner("Running full market tournament across all 10 stocks …"):
-        rank_df = cached_ranking()
-
-    if rank_df.empty:
-        st.error("Could not retrieve data for any stock. "
-                 "Check your internet connection.")
-    else:
-        # Colour-code Expected Return column
-        def colour_return(val):
-            colour = "#10b981" if val >= 0 else "#ef4444"
-            return f"color: {colour}; font-weight: bold"
+        # Style the table
+        def colour_action(val):
+            c = ACTION_COLOUR.get(val, "#9ca3af")
+            return f"color: {c}; font-weight: bold"
 
         def colour_sentiment(val):
-            colour = SENTIMENT_COLOURS.get(val, "#9ca3af")
-            return f"color: {colour}; font-weight: 600"
+            c = SENTIMENT_COLOUR.get(val, "#9ca3af")
+            return f"color: {c}; font-weight: 600"
+
+        def colour_return(val):
+            c = "#10b981" if val >= 0 else "#ef4444"
+            return f"color: {c}; font-weight: bold"
 
         styled = (
-            rank_df.style
-            .applymap(colour_return,   subset=["Expected Return"])
+            overview_df.style
+            .applymap(colour_return,    subset=["Expected Return %"])
             .applymap(colour_sentiment, subset=["Sentiment"])
+            .applymap(colour_action,    subset=["Suggested Action"])
         )
-        st.dataframe(styled, use_container_width=True)
-
-        # Bar chart: expected return
-        fig_rank = go.Figure(go.Bar(
-            x=rank_df["Stock"],
-            y=rank_df["Expected Return"],
-            marker_color=[
-                "#10b981" if r >= 0 else "#ef4444"
-                for r in rank_df["Expected Return"]
-            ],
-            text=[f"{r:+.2f}%" for r in rank_df["Expected Return"]],
-            textposition="outside",
-        ))
-        fig_rank.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            height=400, margin=dict(l=0, r=0, t=30, b=0),
-            xaxis_title="Stock", yaxis_title="Expected 5-Day Return (%)",
-            title="Expected 5-Day Return by Stock",
+        st.dataframe(
+            styled,
+            use_container_width=True,
+            column_config={
+                "Sentiment Reason": st.column_config.TextColumn(
+                    "Sentiment Reason", width="large"),
+            },
         )
-        st.plotly_chart(fig_rank, use_container_width=True)
-
-        # Sentiment distribution pie
-        sent_counts = rank_df["Sentiment"].value_counts()
-        fig_pie = go.Figure(go.Pie(
-            labels=sent_counts.index,
-            values=sent_counts.values,
-            marker_colors=[SENTIMENT_COLOURS.get(l, "#9ca3af")
-                           for l in sent_counts.index],
-            hole=0.4,
-        ))
-        fig_pie.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            height=320, margin=dict(l=0, r=0, t=30, b=0),
-            title="Market Sentiment Distribution",
-        )
-        st.plotly_chart(fig_pie, use_container_width=True)
+    else:
+        st.error("Could not load any stock data. "
+                 "Check your internet connection.")
 
     st.markdown(
         "<div class='disclaimer'>"
-        "⚠️ Rankings are model outputs for research purposes only. "
-        "Not financial advice."
+        "⚠️ Suggested actions are model outputs for research purposes "
+        "only. This is not financial advice."
         "</div>",
-        unsafe_allow_html=True,
+        unsafe_allow_html=True)
+
+
+# ───────────────────────────────────────────────────────────────────
+# TAB 2 — STOCK DEEP DIVE
+# ───────────────────────────────────────────────────────────────────
+with tab_dive:
+
+    st.header(f"{selected_name} — Deep Dive")
+
+    symbol = BURSA_10[selected_name]
+
+    with st.spinner(f"Running engine for {selected_name}..."):
+        df = load_stock_data(symbol, session_label)
+        results, champion, fc5, proc = run_engine(symbol, session_label, df)
+        sentiment = load_sentiment(symbol, selected_name, session_label)
+
+    last_close = float(df["Close"].iloc[-1])
+    exp_return = (float(fc5[-1]) - last_close) / last_close * 100
+    sl_info    = stop_loss_advisory(last_close, fc5, stop_loss_pct)
+    sent_label = sentiment["sentiment_label"]
+    action     = _suggested_action(
+                     exp_return, sent_label, sl_info["breached"])
+    best       = results[champion]
+    da         = round(best["avg_acc"] * 100, 1)
+    mae        = round(best["avg_mae"], 4)
+    actuals_rm = best["actuals_rm"]
+    preds_rm   = best["predictions_rm"]
+
+    # ── Section 1: Projected vs Actual line chart ─────────────────
+    st.subheader("📈 Projected vs Actual Prices")
+    st.caption(
+        "The chart below shows how closely the champion model's "
+        "back-test predictions tracked actual market prices during "
+        "walk-forward validation, followed by the 5-day forecast.")
+
+    # Historical window: last 60 actual prices for context
+    hist_close = df["Close"].iloc[-60:].values
+    n_hist     = len(hist_close)
+    x_hist     = list(range(n_hist))
+
+    # Back-test predictions aligned to the end of history
+    n_bt = min(len(actuals_rm), 60)
+    x_bt = list(range(n_hist - n_bt, n_hist))
+
+    # Forecast continues from today
+    x_fc = list(range(n_hist - 1, n_hist + len(fc5)))
+    fc_y = np.concatenate([[hist_close[-1]], fc5])
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=x_hist, y=hist_close,
+        name="Actual Price",
+        line=dict(color="#10b981", width=2)))
+
+    fig.add_trace(go.Scatter(
+        x=x_bt, y=preds_rm[-n_bt:],
+        name=f"{champion} Back-test",
+        line=dict(color="#f59e0b", width=1.5, dash="dot")))
+
+    fig.add_trace(go.Scatter(
+        x=x_fc, y=fc_y,
+        name="5-Day Forecast",
+        line=dict(color="#3b82f6", width=2),
+        mode="lines+markers",
+        marker=dict(size=6)))
+
+    fig.add_vline(
+        x=n_hist - 1,
+        line_dash="dash",
+        line_color="#6b7280",
+        annotation_text="Today",
+        annotation_position="top")
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=420,
+        margin=dict(l=0, r=0, t=20, b=0),
+        xaxis_title="Trading Days",
+        yaxis_title="Price (RM)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
     )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Section 2: Model info widget ──────────────────────────────
+    st.subheader("🤖 Model Information")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Champion Model", champion)
+    m2.metric("Directional Accuracy", f"{da}%",
+              help="% of steps where model predicted correct direction "
+                   "(leakage-free, RM-scale evaluation)")
+    m3.metric("MAE", f"RM {mae}",
+              help="Mean Absolute Error in Ringgit — lower is better")
+
+    # Loss prevention rules
+    st.markdown("**Loss Prevention Rules**")
+
+    action_colour = ACTION_COLOUR.get(action, "#9ca3af")
+    sl_colour     = "#ef4444" if sl_info["breached"] else "#10b981"
+
+    st.markdown(
+        f"<div class='metric-card'>"
+        f"<b>Suggested Action: </b>"
+        f"<span style='color:{action_colour};font-weight:700;"
+        f"font-size:1.1em'>{action}</span><br><br>"
+        f"<b>Stop-Loss Level ({stop_loss_pct*100:.0f}%):</b> "
+        f"RM {sl_info['threshold']:.4f}<br>"
+        f"<span style='color:{sl_colour}'>{sl_info['advisory']}</span>"
+        f"</div>",
+        unsafe_allow_html=True)
+
+    st.caption(
+        "Champion model = lowest MAE across 5-fold walk-forward "
+        "validation, with a fresh scaler fit per fold to avoid data "
+        "leakage. Directional accuracy measures whether the model "
+        "correctly predicted price direction (up/down) at each step, "
+        "anchored to the previous actual close. Stop-loss threshold "
+        "is adjustable in the sidebar.")
+
+    # ── Section 3: Sentiment (local Llama 3 agent) ─────────────────
+    st.markdown("---")
+    st.subheader("🧠 News & Macro Sentiment (Local AI Agent)")
+
+    badge_col = SENTIMENT_COLOUR.get(sent_label, "#9ca3af")
+    st.markdown(
+        f"**Overall Sentiment** &nbsp;"
+        f"<span style='background:{badge_col};color:white;"
+        f"padding:3px 10px;border-radius:12px;"
+        f"font-size:0.85em'>{sent_label}</span>",
+        unsafe_allow_html=True)
+
+    st.markdown(f"**Macro Impact:** {sentiment['macro_impact']}")
+    st.markdown(f"**Rationale:** {sentiment['qualitative_rationale']}")
+
+    st.caption(
+        "Generated locally by a Llama 3 agent (via Ollama) reading "
+        "live RSS headlines and Malaysia's OPR / CPI / GDP growth "
+        "indicators — no paid API used. If no matching headlines are "
+        "found, a documented Neutral default is shown instead of a "
+        "guess.")
+
+    # Signal conflict warning
+    if sent_label == "Negative" and exp_return > 0:
+        st.warning(
+            "⚡ Signal conflict: the model forecasts a price rise "
+            "but current news sentiment is Negative. "
+            "Treat this signal with extra caution.")
+
+    # ── Disclaimer ────────────────────────────────────────────────
+    st.markdown(
+        "<div class='disclaimer'>"
+        "⚠️ <strong>Disclaimer:</strong> Stock Predictor is a "
+        "research and educational Decision Support System. It does "
+        "<strong>not</strong> constitute financial advice. All "
+        "forecasts carry uncertainty. Past model performance is not "
+        "indicative of future results."
+        "</div>",
+        unsafe_allow_html=True)

@@ -14,6 +14,9 @@ tensorflow>=2.14        # use tensorflow-cpu if you do not have a GPU
 # Sentiment Analysis
 vaderSentiment>=3.3.2
 textblob>=0.17
+feedparser>=6.0
+langchain-community>=0.2
+langchain-core>=0.2
 
 # Dashboard
 streamlit>=1.35
