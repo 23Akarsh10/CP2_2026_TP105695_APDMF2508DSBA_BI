@@ -1,3 +1,4 @@
+import logging
 import os
 import warnings
 
@@ -19,10 +20,76 @@ from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
 from langchain_community.llms import Ollama
 
-
+from dataclasses import dataclass
+from datetime import datetime, time as dtime
+from typing import Optional, Callable, Dict, List
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
+
+@dataclass
+class EngineConfig:
+    """
+    Single source of truth for every previously hardcoded
+    parameter. Pass a custom instance to any function via its
+    config= argument, or edit the module-level CONFIG once at
+    start-up to change behaviour everywhere at once.
+    """
+    # ── preprocessing ──────────────────────────────────────────
+    window_size: int = 60
+
+    # ── feature-engineering windows ────────────────────────────
+    ma_short: int = 20
+    ma_long: int = 50
+    ema_span: int = 20
+    rsi_period: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    bb_period: int = 20
+    bb_std: float = 2.0
+    vol_window: int = 20
+    atr_period: int = 14
+
+    # ── training ────────────────────────────────────────────────
+    epochs: int = 10
+    champion_epochs: int = 15
+    batch_size: int = 32
+    patience: int = 3
+    validation_split: float = 0.1
+    n_splits: int = 5
+
+    # ── forecasting ─────────────────────────────────────────────
+    forecast_horizon: int = 5
+    range_lookback: int = 20
+
+    # ── risk ────────────────────────────────────────────────────
+    stop_pct: float = 0.05
+
+    # ── sentiment ───────────────────────────────────────────────
+    rss_feeds: tuple = (
+        "https://www.theedgemalaysia.com/rss.html",  # The Edge Malaysia
+        "https://www.bernama.com/en/rssfeed.php",    # Bernama
+        "https://www.freemalaysiatoday.com/feeds/rss/headlines/",  # FMT
+        "https://www.malaymail.com/feed/rss/malaysia",             # Malay Mail
+        "https://thesun.my/feed/",                                 # The Sun
+    )
+    max_headlines: int = 8
+    fuzzy_threshold: float = 0.82
+    ollama_model: str = "llama3"
+    ollama_base_url: str = "http://localhost:11434"
+    # Set this to a callable returning {OPR, CPI, GDP_Growth}
+    # to pull live macro data; None keeps the static placeholders.
+    macro_provider: Optional[Callable[[], Dict[str, float]]] = None
+
+    # ── refresh schedule ────────────────────────────────────────
+    half_day_cutoff: dtime = dtime(13, 0)
+    end_of_day_cutoff: dtime = dtime(17, 0)
+
+
+CONFIG = EngineConfig()
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # Fixed random seeds for reproducibility.
 # All three must be set to guarantee consistent results
@@ -78,36 +145,78 @@ def fetch_data(symbol: str, period: str = "5y") -> pd.DataFrame:
 
     return df
 
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_indicators(df: pd.DataFrame,
+                       config: EngineConfig = CONFIG) -> pd.DataFrame:
     """
-    Calculates MA20, MA50, RSI(14), MACD(12/26), Signal(9).
-    These form the feature matrix described in section 3.5.
+    Single shared indicator engine used by BOTH add_features()
+    and the recursive ChampionForecaster, guaranteeing the two
+    never drift apart.
 
-    Drops the first rows where indicators cannot be calculated
-    yet because not enough history exists. MA50 needs 50 days
-    of history before it can produce a value, so the first
-    ~50 rows are removed by dropna().
+    All indicators are causal — each row uses only current and
+    past values, never future ones — so computing them once over
+    the whole series introduces no look-ahead. The only leakage
+    concern in this project was scaling, fixed separately in
+    walk_forward_validation() in the next step.
+
+    Adds: Returns, MA20, MA50, EMA20, RSI(14),
+    MACD(12,26)+Signal(9), Bollinger Bands(20, 2 std-dev),
+    Volatility(20), ATR(14) and Volume.
     """
     df = df.copy()
+    close = df["Close"]
 
-    # Moving averages
-    df["MA20"] = df["Close"].rolling(20).mean()
-    df["MA50"] = df["Close"].rolling(50).mean()
+    # Daily returns + moving averages
+    df["Returns"] = close.pct_change()
+    df["MA20"]    = close.rolling(config.ma_short).mean()
+    df["MA50"]    = close.rolling(config.ma_long).mean()
+    df["EMA20"]   = close.ewm(span=config.ema_span, adjust=False).mean()
 
-    # RSI (14-day)
-    delta = df["Close"].diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    rs    = gain / (loss + 1e-9)    # 1e-9 prevents division by zero
+    # RSI
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(config.rsi_period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(config.rsi_period).mean()
+    rs    = gain / (loss + 1e-9)
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # MACD and Signal line
-    ema12        = df["Close"].ewm(span=12, adjust=False).mean()
-    ema26        = df["Close"].ewm(span=26, adjust=False).mean()
-    df["MACD"]   = ema12 - ema26
-    df["Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    # MACD + Signal
+    ema_fast    = close.ewm(span=config.macd_fast, adjust=False).mean()
+    ema_slow    = close.ewm(span=config.macd_slow, adjust=False).mean()
+    df["MACD"]  = ema_fast - ema_slow
+    df["Signal"] = df["MACD"].ewm(span=config.macd_signal, adjust=False).mean()
 
-    return df.dropna()
+    # Bollinger Bands
+    mid = close.rolling(config.bb_period).mean()
+    std = close.rolling(config.bb_period).std()
+    df["BB_Upper"] = mid + config.bb_std * std
+    df["BB_Lower"] = mid - config.bb_std * std
+
+    # Volatility (rolling std of returns)
+    df["Volatility"] = df["Returns"].rolling(config.vol_window).std()
+
+    # Average True Range (needs High/Low — degrades to 0.0 if absent)
+    if {"High", "Low"}.issubset(df.columns):
+        prev_close = close.shift(1)
+        true_range = pd.concat([
+            (df["High"] - df["Low"]),
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        df["ATR"] = true_range.rolling(config.atr_period).mean()
+    else:
+        df["ATR"] = 0.0
+
+    # Volume passthrough — default to 0.0 (not NaN) so dropna()
+    # never wipes out rows just because Volume was missing.
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+
+    return df
+
+
+def add_features(df: pd.DataFrame,
+                 config: EngineConfig = CONFIG) -> pd.DataFrame:
+    """Computes all 13 indicators and drops warm-up rows containing NaN."""
+    return compute_indicators(df, config).dropna().copy()
 
 def _recompute_indicators(close_series: pd.Series) -> pd.DataFrame:
     """
@@ -143,7 +252,10 @@ class StockPreprocessor:
     the prediction target and inverse_transform uses column 0.
     """
 
-    FEATURES = ["Close", "MA20", "MA50", "RSI", "MACD", "Signal"]
+    FEATURES: List[str] = [
+    "Close", "Returns", "MA20", "MA50", "EMA20",
+    "RSI", "MACD", "Signal", "BB_Upper", "BB_Lower",
+    "Volatility", "ATR", "Volume",]
 
     def __init__(self, window_size: int = 60):
         # 60-day window as specified in the methodology
@@ -157,8 +269,8 @@ class StockPreprocessor:
         Scales the features and builds sliding window sequences.
 
         Returns:
-        X           : input sequences, shape (N, 60, 6)
-                      N windows, each 60 days, 6 features
+        X           : input sequences, shape (N, 60, 13)
+                      N windows, each 60 days, 13 features
         y           : target values, shape (N,)
                       the next-day Close price in scaled form
         scaled_full : the full scaled dataset
@@ -196,7 +308,7 @@ class StockPreprocessor:
         would destabilise the LSTM/GRU layers. Clipping prevents
         this. This is documented as a known limitation.
 
-        row shape: (1, 6)
+        row shape: (1, 13)
         """
         scaled = self.scaler.transform(row)
         return np.clip(scaled, 0.0, 1.0)
@@ -205,7 +317,7 @@ class StockPreprocessor:
 def build_lstm(input_shape):
     """
     2-layer stacked LSTM as specified in section 3.6.
-    input_shape: (60, 6) — 60 days, 6 features.
+    input_shape: (60, 13) — 60 days, 13 features.
     """
     model = Sequential([
         LSTM(50, return_sequences=True, input_shape=input_shape),
@@ -331,7 +443,7 @@ def walk_forward_validation(X:            np.ndarray,
 
         if model_type == "XGBoost":
             model = build_xgboost()
-            # Flatten 3D to 2D: (N, 60, 6) becomes (N, 360)
+            # Flatten 3D to 2D: (N, 60, 13) becomes (N, 780)
             model.fit(X_tr.reshape(len(X_tr), -1), y_tr)
             preds_scaled = model.predict(
                                X_te.reshape(len(X_te), -1))
@@ -382,14 +494,14 @@ def compute_shap_importance(X:            np.ndarray,
     walk_forward_validation — then applies SHAP TreeExplainer
     to quantify the contribution of each feature.
 
-    Since the input is a flattened 60-day x 6-feature window
-    (360 columns total), SHAP values are aggregated across
+    Since the input is a flattened 60-day x 13-feature window
+    (780 columns total), SHAP values are aggregated across
     all 60 time steps to produce one score per feature.
 
     Returns a DataFrame ['Feature', 'SHAP Importance'] sorted
     by importance descending.
     """
-    # Flatten: (N, 60, 6) → (N, 360)
+    # Flatten: (N, 60, 13) → (N, 780)
     X_flat = X.reshape(X.shape[0], -1)
 
     # Train XGBoost on the TRUE forecasting target y
@@ -402,13 +514,13 @@ def compute_shap_importance(X:            np.ndarray,
     explainer  = shap.TreeExplainer(model, background)
     shap_vals  = explainer.shap_values(background)
 
-    # shap_vals shape: (n_bg, 360)
-    # Reshape to (n_bg, 60 days, 6 features) then average
+    # shap_vals shape: (n_bg, 780)
+    # Reshape to (n_bg, 60 days, 13 features) then average
     # across samples and days to get one score per feature
     n_features = len(preprocessor.features)
     window     = preprocessor.window_size
     shap_3d    = shap_vals.reshape(n_bg, window, n_features)
-    importance = np.abs(shap_3d).mean(axis=(0, 1))    # shape (6,)
+    importance = np.abs(shap_3d).mean(axis=(0, 1))    # shape (13,)
 
     df = pd.DataFrame({
         "Feature":         preprocessor.features,
