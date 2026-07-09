@@ -1,24 +1,3 @@
-"""
-app.py — Stock Predictor Dashboard
-====================================
-Streamlit dashboard for the Bursa Malaysia Stock Decision Support System.
-
-Wired against the review-hardened engine.py:
-  - walk_forward_validation(df, proc, ...) takes the feature-engineered
-    DataFrame, not pre-scaled (X, y) arrays — fixes data leakage.
-  - 13 technical features instead of 6 (Returns, EMA20, Bollinger Bands,
-    Volatility, ATR, Volume added).
-  - Sentiment comes from the local Ollama/Llama 3 agent
-    (run_sentiment_agent) instead of VADER/TextBlob.
-  - ChampionForecaster.fit() takes raw_df (not symbol=) and no longer
-    persists to disk — model_cache logic removed to match engine.py.
-
-Layout:
-  Sidebar      : stock selector + CRISP-DM tracker + stop-loss slider
-  Main Tab 1   : Market Overview table (all 10 stocks at a glance)
-  Main Tab 2   : Stock Deep Dive (projected vs actual chart + model info)
-"""
-
 import os
 import warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "3"
@@ -29,8 +8,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import joblib
+from pathlib import Path
 
-from engine import (
+from engine_final import (
     fetch_data,
     add_features,
     StockPreprocessor,
@@ -66,10 +47,12 @@ BURSA_10 = {
 # PAGE CONFIG
 # ═══════════════════════════════════════════════════════════════════
 
+LOGO_PATH = Path(__file__).parent / "logo.png"
+
 st.set_page_config(
-    page_title="Stock Predictor",
+    page_title="Decision Support System for Stock Markets",
     layout="wide",
-    page_icon="📈",
+    page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else None,
 )
 
 st.markdown("""
@@ -98,6 +81,19 @@ st.markdown("""
 
 
 # ═══════════════════════════════════════════════════════════════════
+# TITLE BAR
+# ═══════════════════════════════════════════════════════════════════
+
+header_logo_col, header_title_col = st.columns([1, 6])
+with header_logo_col:
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), width=90)
+with header_title_col:
+    st.title("Decision Support System for Stock Markets")
+    st.caption("Bursa Malaysia Top 10 - Quantitative Forecasting and Market Intelligence")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════
 
@@ -123,10 +119,10 @@ def _suggested_action(exp_return: float, sentiment: str,
       - Stop-loss breach flag (risk management)
 
     Rules:
-      If stop-loss is breached                        → Sell
-      If return > 1% and sentiment is Positive        → Buy
-      If return < -1% or sentiment is Negative        → Sell
-      Otherwise                                        → Hold
+      If stop-loss is breached                        : Sell
+      If return > 1% and sentiment is Positive        : Buy
+      If return < -1% or sentiment is Negative        : Sell
+      Otherwise                                        : Hold
     """
     if stop_breached:
         return "Sell"
@@ -139,16 +135,58 @@ def _suggested_action(exp_return: float, sentiment: str,
 
 def _trend_label(exp_return: float) -> str:
     """Bullish if expected return is positive, Bearish if negative."""
-    return "Bullish 📈" if exp_return >= 0 else "Bearish 📉"
+    return "Bullish" if exp_return >= 0 else "Bearish"
 
 
 # ═══════════════════════════════════════════════════════════════════
 # CACHING
 # ═══════════════════════════════════════════════════════════════════
-# Cache keys include the current session label (morning / half_day /
-# end_of_day) from engine.get_current_session_label(), so results only
-# recompute once per checkpoint — like a scoreboard updating at
-# half-time and full-time rather than on every page interaction.
+# The engine is split into two independently cached stages so that
+# model SELECTION (comparing XGBoost, LSTM and GRU) only ever runs
+# once per stock, while model FORECASTING (retraining and running
+# just the champion) refreshes on each session checkpoint.
+#
+#   Stage A - select_champion_model()
+#       Runs walk-forward validation for all 3 candidate models and
+#       picks the champion (lowest MAE). Cached to disk keyed ONLY by
+#       symbol, so it is not repeated on every session or app restart.
+#       It only reruns if its cache file is removed (see the
+#       "Rebuild model selection" button in the sidebar).
+#
+#   Stage B - run_champion_forecast()
+#       Retrains ONLY the already-selected champion model on the
+#       latest available data and produces the 5-day forecast. Cached
+#       to disk keyed by (symbol, session_label), so it refreshes once
+#       per checkpoint (morning / half_day / end_of_day) as new data
+#       is collected, without re-running the other two algorithms.
+#
+# TWO LAYERS for each stage:
+#   1. st.cache_resource - in-memory, avoids recompute on Streamlit
+#      reruns WITHIN the same running process (e.g. widget interaction).
+#   2. Disk cache (joblib) - survives a full process restart (dev
+#      server restart, redeploy, Streamlit Cloud sleep/wake).
+#
+# Neither stage returns a trained model object (XGBoost/Keras models
+# are created and used internally, then discarded) - only plain
+# numpy/dict/string results - so a lightweight joblib dump/load is
+# enough; there is no need to serialize model binaries.
+
+MODEL_SELECTION_CACHE_DIR = Path("model_selection_cache")
+MODEL_SELECTION_CACHE_DIR.mkdir(exist_ok=True)
+
+ENGINE_CACHE_DIR = Path("engine_cache")
+ENGINE_CACHE_DIR.mkdir(exist_ok=True)
+
+
+def _selection_cache_path(symbol: str) -> Path:
+    safe_symbol = symbol.replace(".", "_")
+    return MODEL_SELECTION_CACHE_DIR / f"{safe_symbol}.joblib"
+
+
+def _forecast_cache_path(symbol: str, session_label: str) -> Path:
+    safe_symbol = symbol.replace(".", "_")
+    return ENGINE_CACHE_DIR / f"{safe_symbol}__{session_label}.joblib"
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_stock_data(symbol: str, session_label: str):
@@ -159,41 +197,85 @@ def load_stock_data(symbol: str, session_label: str):
 
 
 @st.cache_resource(show_spinner=False)
-def run_engine(symbol: str, session_label: str, _df):
+def select_champion_model(symbol: str, _df):
     """
-    Runs the full quantitative engine for one stock:
-      1. Builds a StockPreprocessor
-      2. Runs leakage-free walk-forward validation for all 3 base models
-      3. Selects champion (lowest MAE)
-      4. Retrains champion on full data
-      5. Generates 5-day forecast with full indicator recomputation
-    Returns everything needed for the dashboard.
+    Stage A - runs ONCE per stock, not once per session.
 
-    Note: walk_forward_validation() takes the feature-engineered
-    DataFrame directly (not pre-scaled X, y) — it fits a fresh scaler
-    per fold internally to avoid data leakage.
+    Runs leakage-free walk-forward validation for all 3 base models
+    (XGBoost, LSTM, GRU) and selects the champion (lowest MAE). This
+    comparison is expensive and does not need to be repeated every
+    time new data is collected; the champion architecture, once
+    chosen, is reused going forward.
+
+    Disk-cached per symbol only (no session_label in the key): if a
+    selection already exists on disk, it is loaded instead of
+    re-running all three algorithms. Use "Rebuild model selection" in
+    the sidebar to force this to run again.
     """
+    cache_path = _selection_cache_path(symbol)
+
+    if cache_path.exists():
+        try:
+            return joblib.load(cache_path)
+        except Exception:
+            pass  # corrupt/incompatible cache file - fall through and rerun
+
     proc = StockPreprocessor()
 
-    # Walk-forward validation for the three base architectures
     results = {}
     for mtype in ["XGBoost", "LSTM", "GRU"]:
-        res = walk_forward_validation(_df, proc, model_type=mtype, n_splits=5)
-        results[mtype] = res
+        results[mtype] = walk_forward_validation(_df, proc, model_type=mtype, n_splits=5)
 
-    # Champion = lowest MAE
     champion = min(results, key=lambda k: results[k]["avg_mae"])
 
-    # Retrain champion on full data and forecast 5 days.
-    # ChampionForecaster.fit() needs a freshly-prepared (X, y, scaled)
-    # from the SAME preprocessor instance used above, fit on all data —
-    # this is the one place prepare_data() (fit-on-all) is correct to use.
+    output = (results, champion)
+    try:
+        joblib.dump(output, cache_path)
+    except Exception:
+        pass  # disk cache is a bonus, not required for the app to work
+
+    return output
+
+
+@st.cache_resource(show_spinner=False)
+def run_champion_forecast(symbol: str, session_label: str, _df, champion: str):
+    """
+    Stage B - runs once per session checkpoint.
+
+    Retrains ONLY the already-selected champion model on the latest
+    available data and generates the 5-day forecast. The other two
+    algorithms are not touched here; model selection is handled
+    separately by select_champion_model() above.
+
+    Note: prepare_data() fits a scaler on all available data - this is
+    the one place that is appropriate, since the champion is being
+    retrained on the full, latest dataset for forecasting rather than
+    being evaluated fold-by-fold.
+
+    Disk-cached per (symbol, session_label): if a checkpoint's result
+    already exists on disk, it is loaded instead of retraining.
+    """
+    cache_path = _forecast_cache_path(symbol, session_label)
+
+    if cache_path.exists():
+        try:
+            return joblib.load(cache_path)
+        except Exception:
+            pass  # corrupt/incompatible cache file - fall through and retrain
+
+    proc = StockPreprocessor()
     X, y, scaled = proc.prepare_data(_df)
     champ = ChampionForecaster(proc)
     champ.fit(X, y, scaled, champion, raw_df=_df)
     forecast_5 = champ.forecast(n_days=5)
 
-    return results, champion, forecast_5, proc
+    output = (forecast_5, proc)
+    try:
+        joblib.dump(output, cache_path)
+    except Exception:
+        pass  # disk cache is a bonus, not required for the app to work
+
+    return output
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -219,7 +301,8 @@ def build_stock_row(idx: int, name: str, symbol: str,
     """
     try:
         df = load_stock_data(symbol, session_label)
-        results, champion, fc5, proc = run_engine(symbol, session_label, df)
+        results, champion = select_champion_model(symbol, df)
+        fc5, proc = run_champion_forecast(symbol, session_label, df, champion)
         sentiment = load_sentiment(symbol, name, session_label)
 
         last_close = float(df["Close"].iloc[-1])
@@ -268,7 +351,9 @@ session_label = get_current_session_label()
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════════
 
-st.sidebar.title("📈 Stock Predictor")
+if LOGO_PATH.exists():
+    st.sidebar.image(str(LOGO_PATH), width=110)
+st.sidebar.title("Decision Support System")
 st.sidebar.markdown("---")
 selected_name = st.sidebar.selectbox(
     "Select stock for deep dive",
@@ -278,24 +363,51 @@ stop_loss_pct = st.sidebar.slider(
     "Stop-Loss Threshold (%)", 1, 15, 5) / 100
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("CRISP-DM Cycle")
-st.sidebar.success("✅ Business Understanding")
-st.sidebar.success("✅ Data Understanding")
-st.sidebar.success("✅ Data Preparation")
-st.sidebar.warning("⏳ Modelling (Active)")
-st.sidebar.info("⏳ Evaluation")
-st.sidebar.info("⏳ Deployment")
+st.sidebar.subheader("Project Pipeline")
+pipeline_stages = [
+    "Data Collection",
+    "Data Preprocessing and Feature Engineering",
+    "Dataset Preparation",
+    "Model Development and Hyperparameter Optimisation",
+    "Model Evaluation and Explainability",
+    "Model Selection and Forecasting",
+    "AI Based Market Intelligence",
+    "Investment Decision Support",
+]
+st.sidebar.markdown(
+    "\n".join(f"{i}. {stage}" for i, stage in enumerate(pipeline_stages, start=1))
+)
 st.sidebar.markdown("---")
 
 session_caption = {
-    "morning":    "🌅 Session: Morning (pre 1:00 PM)",
-    "half_day":   "🕐 Session: Half-Day (1:00–5:00 PM)",
-    "end_of_day": "🌆 Session: End-of-Day (post 5:00 PM)",
+    "morning":    "Session: Morning (before 1:00 PM)",
+    "half_day":   "Session: Half-Day (1:00 PM to 5:00 PM)",
+    "end_of_day": "Session: End-of-Day (after 5:00 PM)",
 }
 st.sidebar.caption(session_caption.get(session_label, session_label))
 st.sidebar.caption(
     "Data sourced from Yahoo Finance. Sentiment generated locally via "
-    "Ollama + Llama 3. For research and educational use only.")
+    "Ollama and Llama 3. For research and educational use only.")
+
+if st.sidebar.button("Refresh forecast (new session data)"):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    for f in ENGINE_CACHE_DIR.glob("*.joblib"):
+        f.unlink()
+    st.rerun()
+
+if st.sidebar.button("Rebuild model selection (all algorithms)"):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    for f in ENGINE_CACHE_DIR.glob("*.joblib"):
+        f.unlink()
+    for f in MODEL_SELECTION_CACHE_DIR.glob("*.joblib"):
+        f.unlink()
+    st.rerun()
+st.sidebar.caption(
+    "Refresh forecast retrains only the selected champion model on "
+    "the latest data. Rebuild model selection re-compares all three "
+    "algorithms and should rarely be needed.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -303,17 +415,17 @@ st.sidebar.caption(
 # ═══════════════════════════════════════════════════════════════════
 
 tab_overview, tab_dive = st.tabs([
-    "📊 Market Overview",
-    f"🔍 {selected_name} — Deep Dive",
+    "Market Overview",
+    f"{selected_name} - Deep Dive",
 ])
 
 
 # ───────────────────────────────────────────────────────────────────
-# TAB 1 — MARKET OVERVIEW TABLE
+# TAB 1 - MARKET OVERVIEW TABLE
 # ───────────────────────────────────────────────────────────────────
 with tab_overview:
 
-    st.header("Market Overview — Bursa Malaysia Top 10")
+    st.header("Market Overview - Bursa Malaysia Top 10")
     st.caption(
         "All 10 stocks processed through the quantitative engine. "
         "Champion model selected per stock by lowest walk-forward MAE "
@@ -363,9 +475,9 @@ with tab_overview:
 
         styled = (
             overview_df.style
-            .applymap(colour_return,    subset=["Expected Return %"])
-            .applymap(colour_sentiment, subset=["Sentiment"])
-            .applymap(colour_action,    subset=["Suggested Action"])
+            .map(colour_return,    subset=["Expected Return %"])
+            .map(colour_sentiment, subset=["Sentiment"])
+            .map(colour_action,    subset=["Suggested Action"])
         )
         st.dataframe(
             styled,
@@ -381,24 +493,31 @@ with tab_overview:
 
     st.markdown(
         "<div class='disclaimer'>"
-        "⚠️ Suggested actions are model outputs for research purposes "
+        "Suggested actions are model outputs for research purposes "
         "only. This is not financial advice."
+        "<br><br>"
+        "Developed by Akarsh Sriram (Student ID: TP105695), under the "
+        "guidance of Dr. Preethi Subramanian, as part of the MSc Data "
+        "Science and Business Analytics programme, Intake "
+        "APDMF2508DSBA(BI), Asia Pacific University of Technology and "
+        "Innovation (APU), in collaboration with De Montfort University."
         "</div>",
         unsafe_allow_html=True)
 
 
 # ───────────────────────────────────────────────────────────────────
-# TAB 2 — STOCK DEEP DIVE
+# TAB 2 - STOCK DEEP DIVE
 # ───────────────────────────────────────────────────────────────────
 with tab_dive:
 
-    st.header(f"{selected_name} — Deep Dive")
+    st.header(f"{selected_name} - Deep Dive")
 
     symbol = BURSA_10[selected_name]
 
     with st.spinner(f"Running engine for {selected_name}..."):
         df = load_stock_data(symbol, session_label)
-        results, champion, fc5, proc = run_engine(symbol, session_label, df)
+        results, champion = select_champion_model(symbol, df)
+        fc5, proc = run_champion_forecast(symbol, session_label, df, champion)
         sentiment = load_sentiment(symbol, selected_name, session_label)
 
     last_close = float(df["Close"].iloc[-1])
@@ -413,8 +532,8 @@ with tab_dive:
     actuals_rm = best["actuals_rm"]
     preds_rm   = best["predictions_rm"]
 
-    # ── Section 1: Projected vs Actual line chart ─────────────────
-    st.subheader("📈 Projected vs Actual Prices")
+    # -- Section 1: Projected vs Actual line chart -----------------
+    st.subheader("Projected vs Actual Prices")
     st.caption(
         "The chart below shows how closely the champion model's "
         "back-test predictions tracked actual market prices during "
@@ -471,8 +590,8 @@ with tab_dive:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Section 2: Model info widget ──────────────────────────────
-    st.subheader("🤖 Model Information")
+    # -- Section 2: Model info widget -------------------------------
+    st.subheader("Model Information")
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Champion Model", champion)
@@ -480,7 +599,7 @@ with tab_dive:
               help="% of steps where model predicted correct direction "
                    "(leakage-free, RM-scale evaluation)")
     m3.metric("MAE", f"RM {mae}",
-              help="Mean Absolute Error in Ringgit — lower is better")
+              help="Mean Absolute Error in Ringgit - lower is better")
 
     # Loss prevention rules
     st.markdown("**Loss Prevention Rules**")
@@ -507,9 +626,9 @@ with tab_dive:
         "anchored to the previous actual close. Stop-loss threshold "
         "is adjustable in the sidebar.")
 
-    # ── Section 3: Sentiment (local Llama 3 agent) ─────────────────
+    # -- Section 3: Sentiment (local Llama 3 agent) -----------------
     st.markdown("---")
-    st.subheader("🧠 News & Macro Sentiment (Local AI Agent)")
+    st.subheader("News and Macro Sentiment (Local AI Agent)")
 
     badge_col = SENTIMENT_COLOUR.get(sent_label, "#9ca3af")
     st.markdown(
@@ -524,25 +643,31 @@ with tab_dive:
 
     st.caption(
         "Generated locally by a Llama 3 agent (via Ollama) reading "
-        "live RSS headlines and Malaysia's OPR / CPI / GDP growth "
-        "indicators — no paid API used. If no matching headlines are "
+        "live RSS headlines and Malaysia's OPR, CPI and GDP growth "
+        "indicators - no paid API used. If no matching headlines are "
         "found, a documented Neutral default is shown instead of a "
         "guess.")
 
     # Signal conflict warning
     if sent_label == "Negative" and exp_return > 0:
         st.warning(
-            "⚡ Signal conflict: the model forecasts a price rise "
+            "Signal conflict: the model forecasts a price rise "
             "but current news sentiment is Negative. "
             "Treat this signal with extra caution.")
 
-    # ── Disclaimer ────────────────────────────────────────────────
+    # -- Disclaimer --------------------------------------------------
     st.markdown(
         "<div class='disclaimer'>"
-        "⚠️ <strong>Disclaimer:</strong> Stock Predictor is a "
-        "research and educational Decision Support System. It does "
+        "<strong>Disclaimer:</strong> This Decision Support System is "
+        "a research and educational project. It does "
         "<strong>not</strong> constitute financial advice. All "
         "forecasts carry uncertainty. Past model performance is not "
         "indicative of future results."
+        "<br><br>"
+        "Developed by Akarsh Sriram (Student ID: TP105695), under the "
+        "guidance of Dr. Preethi Subramanian, as part of the MSc Data "
+        "Science and Business Analytics programme, Intake "
+        "APDMF2508DSBA(BI), Asia Pacific University of Technology and "
+        "Innovation (APU), in collaboration with De Montfort University."
         "</div>",
         unsafe_allow_html=True)

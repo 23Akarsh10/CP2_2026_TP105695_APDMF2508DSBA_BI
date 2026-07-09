@@ -245,73 +245,78 @@ def _recompute_indicators(close_series: pd.Series) -> pd.DataFrame:
 
 class StockPreprocessor:
     """
-    Handles Min-Max normalisation and 60-day sliding window
-    sequence building.
+    Builds sliding-window sequences and manages MinMax scaling.
 
-    Close must remain at index 0 in FEATURES because it is
-    the prediction target and inverse_transform uses column 0.
+    Scaling responsibility: prepare_data() fits the scaler on
+    ALL data and is used only by the champion / direct
+    forecasters, where the target is the genuine future and no
+    evaluation metric is at stake. walk_forward_validation()
+    does NOT use prepare_data() — it fits a fresh scaler per
+    fold on training rows only, fixing the data-leakage issue
+    raised in the academic review.
     """
 
-    FEATURES: List[str] = [
-    "Close", "Returns", "MA20", "MA50", "EMA20",
-    "RSI", "MACD", "Signal", "BB_Upper", "BB_Lower",
-    "Volatility", "ATR", "Volume",]
+    FEATURES = FEATURES
 
-    def __init__(self, window_size: int = 60):
-        # 60-day window as specified in the methodology
-        self.window_size = window_size
-        # MinMaxScaler transforms each feature to range [0, 1]
+    def __init__(self, window_size: int = None, config: EngineConfig = CONFIG):
+        self.config      = config
+        self.window_size = window_size or config.window_size
         self.scaler      = MinMaxScaler(feature_range=(0, 1))
-        self.features    = self.FEATURES
+        self.features    = list(self.FEATURES)
+
+    def get_feature_matrix(self, df: pd.DataFrame) -> np.ndarray:
+        """Extracts the raw, UNSCALED feature columns as a numpy array."""
+        return df[self.features].values
+
+    def build_sequences(self, scaled: np.ndarray):
+        """
+        Slides the 60-day window across an already-scaled array.
+        Sequence j uses rows [j, j+window) as input and the Close
+        value at row (j+window) as the target.
+        """
+        X, y = [], []
+        for i in range(self.window_size, len(scaled)):
+            X.append(scaled[i - self.window_size:i])
+            y.append(scaled[i, 0])               # Close is index 0
+        return np.array(X), np.array(y)
 
     def prepare_data(self, df: pd.DataFrame):
         """
-        Scales the features and builds sliding window sequences.
-
-        Returns:
-        X           : input sequences, shape (N, 60, 13)
-                      N windows, each 60 days, 13 features
-        y           : target values, shape (N,)
-                      the next-day Close price in scaled form
-        scaled_full : the full scaled dataset
-                      kept for use in forecasting later
+        Returns (X, y, scaled_full). Fits the scaler on the FULL
+        dataset. Use only for champion training / true forecasting,
+        never for walk-forward evaluation.
         """
-        data        = df[self.features].values
-        scaled_full = self.scaler.fit_transform(data)
+        scaled_full = self.scaler.fit_transform(self.get_feature_matrix(df))
+        X, y = self.build_sequences(scaled_full)
+        return X, y, scaled_full
 
-        X, y = [], []
-        for i in range(self.window_size, len(scaled_full)):
-            X.append(scaled_full[i - self.window_size : i])
-            y.append(scaled_full[i, 0])   # Close is column 0
-
-        return np.array(X), np.array(y), scaled_full
-
-    def inverse_transform(self, pred: np.ndarray) -> np.ndarray:
+    def inverse_transform(self, pred: np.ndarray,
+                          scaler: MinMaxScaler = None) -> np.ndarray:
         """
-        Converts scaled Close predictions back to actual RM prices.
-        Needed to display real prices in the dashboard and to
-        compute metrics in RM rather than in scaled values.
+        Inverse-scales a 1-D array of Close predictions to RM
+        prices. Accepts an optional per-fold scaler — this is what
+        lets walk_forward_validation() invert each fold correctly
+        using THAT fold's scaler, not the preprocessor's own one.
         """
-        dummy       = np.zeros((len(pred), len(self.features)))
-        dummy[:, 0] = pred.flatten()
-        return self.scaler.inverse_transform(dummy)[:, 0]
+        sc = scaler if scaler is not None else self.scaler
+        dummy = np.zeros((len(pred), len(self.features)))
+        dummy[:, 0] = np.asarray(pred).flatten()
+        return sc.inverse_transform(dummy)[:, 0]
+
+    def get_last_window_3d(self, scaled_full: np.ndarray) -> np.ndarray:
+        return scaled_full[-self.window_size:][np.newaxis, ...]
+
+    def get_last_window_2d(self, scaled_full: np.ndarray) -> np.ndarray:
+        return scaled_full[-self.window_size:].flatten()[np.newaxis, :]
 
     def scale_row(self, row: np.ndarray) -> np.ndarray:
         """
-        Scales a single new feature row using the already-fitted
-        scaler. Used during recursive forecasting.
-
-        Clips output to [0, 1] to guard against scaler
-        extrapolation instability. If a predicted price exceeds
-        the historical min/max range the scaler was trained on,
-        the resulting scaled value would be outside [0, 1] and
-        would destabilise the LSTM/GRU layers. Clipping prevents
-        this. This is documented as a known limitation.
-
-        row shape: (1, 13)
+        Scales a single new feature row with the fitted scaler,
+        clipping to [0, 1] to guard against scaler extrapolation
+        when a predicted price leaves the historical min/max
+        range. Documented known limitation.
         """
-        scaled = self.scaler.transform(row)
-        return np.clip(scaled, 0.0, 1.0)
+        return np.clip(self.scaler.transform(row), 0.0, 1.0)
     
 
 def build_lstm(input_shape):
@@ -407,65 +412,87 @@ def sharpe_ratio(y_true_rm: np.ndarray,
         return 0.0
     return float(np.sqrt(252) * excess.mean() / excess.std())
 
-def walk_forward_validation(X:            np.ndarray,
-                             y:            np.ndarray,
-                             preprocessor: StockPreprocessor,
-                             model_type:   str = "XGBoost",
-                             n_splits:     int = 5,
-                             epochs:       int = 10) -> dict:
+def walk_forward_validation(df: pd.DataFrame,
+                            preprocessor: "StockPreprocessor",
+                            model_type: str = "XGBoost",
+                            n_splits: int = None,
+                            epochs: int = None,
+                            model_params: dict = None,
+                            config: EngineConfig = CONFIG) -> dict:
     """
-    Expanding-window walk-forward cross-validation.
-    Implements section 3.6 of the methodology.
+    Expanding-window walk-forward cross-validation with NO data
+    leakage.
 
-    All metrics are computed on inverse-transformed RM prices
-    so MAE is interpretable as actual Ringgit error.
+    For each fold a fresh MinMaxScaler is fit on that fold's
+    TRAINING rows only, then applied to the whole series. Test
+    rows are therefore scaled with parameters they never
+    influenced. All metrics are computed on inverse-transformed
+    RM prices, so MAE is a genuine Ringgit error.
 
-    Returns averaged MAE (RM), directional accuracy, Sharpe
-    Ratio, and all predictions/actuals in RM for charting.
+    Takes the feature-engineered DataFrame (unscaled) instead of
+    pre-scaled (X, y), because the scaler can no longer be fit
+    globally up front.
     """
-    fold_size  = len(X) // (n_splits + 1)
-    maes, accs, sharpes       = [], [], []
+    n_splits = n_splits or config.n_splits
+    epochs   = epochs or config.epochs
+    W        = preprocessor.window_size
+
+    raw   = preprocessor.get_feature_matrix(df)        # unscaled (T, F)
+    n_seq = len(raw) - W
+    if n_seq <= n_splits:
+        raise ValueError(
+            f"Not enough data ({n_seq} sequences) for {n_splits} splits."
+        )
+    fold_size = n_seq // (n_splits + 1)
+
+    maes, accs, sharpes = [], [], []
     all_preds_rm, all_acts_rm = [], []
 
-    # EarlyStopping halts training when validation loss stops
-    # improving for 3 consecutive epochs. Prevents overfitting.
-    early_stop = EarlyStopping(patience=3,
-                               restore_best_weights=True,
-                               verbose=0)
-
     for i in range(n_splits):
-        train_end  = fold_size * (i + 1)
-        test_start = train_end
-        test_end   = min(test_start + fold_size, len(X))
+        train_end_seq  = fold_size * (i + 1)
+        test_start_seq = train_end_seq
+        test_end_seq   = min(test_start_seq + fold_size, n_seq)
 
-        X_tr, X_te = X[:train_end], X[test_start:test_end]
-        y_tr, y_te = y[:train_end], y[test_start:test_end]
+        # Fit scaler on TRAINING rows only. Training sequences
+        # target rows [W, W+train_end_seq); the last input window
+        # ends just before train_raw_end, so this covers exactly
+        # what the training set can see — nothing from the future.
+        train_raw_end = W + train_end_seq
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        scaler.fit(raw[:train_raw_end])
+        scaled_all = scaler.transform(raw)            # transform-only on test
+
+        X_all, y_all = preprocessor.build_sequences(scaled_all)
+        X_tr, y_tr   = X_all[:train_end_seq], y_all[:train_end_seq]
+        X_te         = X_all[test_start_seq:test_end_seq]
+        y_te         = y_all[test_start_seq:test_end_seq]
+        if len(X_te) == 0:
+            continue
 
         if model_type == "XGBoost":
-            model = build_xgboost()
-            # Flatten 3D to 2D: (N, 60, 13) becomes (N, 780)
+            model = build_xgboost(model_params)
             model.fit(X_tr.reshape(len(X_tr), -1), y_tr)
-            preds_scaled = model.predict(
-                               X_te.reshape(len(X_te), -1))
+            preds_scaled = model.predict(X_te.reshape(len(X_te), -1))
 
-        elif model_type == "LSTM":
-            model = build_lstm((X_tr.shape[1], X_tr.shape[2]))
-            model.fit(X_tr, y_tr, epochs=epochs,
-                      batch_size=32, validation_split=0.1,
-                      callbacks=[early_stop], verbose=0)
+        elif model_type in SEQUENCE_MODELS:
+            mp = model_params or {}
+            seq_kw = {k: mp[k] for k in
+                     ("units", "dropout", "learning_rate",
+                      "num_heads", "num_blocks") if k in mp}
+            batch_size = mp.get("batch_size", config.batch_size)
+            model = build_sequence_model(
+                model_type, (X_tr.shape[1], X_tr.shape[2]), **seq_kw)
+            model.fit(X_tr, y_tr, epochs=epochs, batch_size=batch_size,
+                      validation_split=config.validation_split,
+                      callbacks=_build_callbacks(config), verbose=0)
             preds_scaled = model.predict(X_te, verbose=0).flatten()
 
-        elif model_type == "GRU":
-            model = build_gru((X_tr.shape[1], X_tr.shape[2]))
-            model.fit(X_tr, y_tr, epochs=epochs,
-                      batch_size=32, validation_split=0.1,
-                      callbacks=[early_stop], verbose=0)
-            preds_scaled = model.predict(X_te, verbose=0).flatten()
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
 
-        # Inverse-transform BEFORE computing any metrics.
-        # This ensures all metrics are in RM not scaled values.
-        true_rm  = preprocessor.inverse_transform(y_te)
-        preds_rm = preprocessor.inverse_transform(preds_scaled)
+        # Inverse-transform with THIS fold's scaler → metrics in RM.
+        true_rm  = preprocessor.inverse_transform(y_te, scaler=scaler)
+        preds_rm = preprocessor.inverse_transform(preds_scaled, scaler=scaler)
 
         maes.append(mean_absolute_error(true_rm, preds_rm))
         accs.append(directional_accuracy(true_rm, preds_rm))
@@ -474,9 +501,9 @@ def walk_forward_validation(X:            np.ndarray,
         all_acts_rm.extend(true_rm.tolist())
 
     return {
-        "avg_mae":        float(np.mean(maes)),
-        "avg_acc":        float(np.mean(accs)),
-        "avg_sharpe":     float(np.mean(sharpes)),
+        "avg_mae":        float(np.mean(maes)) if maes else float("nan"),
+        "avg_acc":        float(np.mean(accs)) if accs else float("nan"),
+        "avg_sharpe":     float(np.mean(sharpes)) if sharpes else float("nan"),
         "predictions_rm": np.array(all_preds_rm),
         "actuals_rm":     np.array(all_acts_rm),
         "predictions":    np.array(all_preds_rm),
