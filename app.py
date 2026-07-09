@@ -619,7 +619,7 @@ with tab_dive:
         unsafe_allow_html=True)
 
     st.caption(
-        "Champion model = lowest MAE across 5-fold walk-forward "
+        "Champion model selected by choosing the one with the lowest MAE across 5-fold walk-forward "
         "validation, with a fresh scaler fit per fold to avoid data "
         "leakage. Directional accuracy measures whether the model "
         "correctly predicted price direction (up/down) at each step, "
@@ -644,7 +644,7 @@ with tab_dive:
     st.caption(
         "Generated locally by a Llama 3 agent (via Ollama) reading "
         "live RSS headlines and Malaysia's OPR, CPI and GDP growth "
-        "indicators - no paid API used. If no matching headlines are "
+        "indicators. No paid API used. If no matching headlines are "
         "found, a documented Neutral default is shown instead of a "
         "guess.")
 

@@ -60,18 +60,14 @@ except ImportError:
     _HAS_OLLAMA = False
 
 try:
-    from tensorflow.keras.models import Sequential, Model
-    from tensorflow.keras.layers import (
-        LSTM, GRU, Dense, Dropout, Bidirectional, Input,
-        MultiHeadAttention, LayerNormalization, GlobalAveragePooling1D, Add,
-    )
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
     from tensorflow.keras.optimizers import Adam
     from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
     _HAS_TF = True
 except ImportError:
-    Sequential = Model = None
-    LSTM = GRU = Dense = Dropout = Bidirectional = Input = None
-    MultiHeadAttention = LayerNormalization = GlobalAveragePooling1D = Add = None
+    Sequential = None
+    LSTM = GRU = Dense = Dropout = None
     Adam = EarlyStopping = ReduceLROnPlateau = None
     _HAS_TF = False
 
@@ -277,60 +273,8 @@ def build_gru(input_shape, units=50, dropout=0.2, learning_rate=None):
     return _compile(model, learning_rate)
 
 
-def build_bilstm(input_shape, units=50, dropout=0.2, learning_rate=None):
-    _require(_HAS_TF, "tensorflow", "the BiLSTM model")
-    model = Sequential([
-        Bidirectional(LSTM(units, return_sequences=True), input_shape=input_shape),
-        Dropout(dropout),
-        Bidirectional(LSTM(units, return_sequences=False)),
-        Dropout(dropout),
-        Dense(25, activation="relu"),
-        Dense(1),
-    ], name="BiLSTM")
-    return _compile(model, learning_rate)
-
-
-def build_attention_lstm(input_shape, units=50, dropout=0.2, learning_rate=None, num_heads=4):
-    _require(_HAS_TF, "tensorflow", "the Attention-LSTM model")
-    key_dim = max(1, units // num_heads)
-    inp = Input(shape=input_shape)
-    x = LSTM(units, return_sequences=True)(inp)
-    x = Dropout(dropout)(x)
-    attn = MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)(x, x)
-    x = Add()([x, attn])
-    x = LayerNormalization()(x)
-    x = GlobalAveragePooling1D()(x)
-    x = Dense(25, activation="relu")(x)
-    out = Dense(1)(x)
-    return _compile(Model(inp, out, name="AttentionLSTM"), learning_rate)
-
-
-def _transformer_block(x, num_heads, ff_dim, dropout):
-    feature_dim = x.shape[-1]
-    attn = MultiHeadAttention(num_heads=num_heads, key_dim=max(1, feature_dim // num_heads), dropout=dropout)(x, x)
-    x = LayerNormalization(epsilon=1e-6)(Add()([x, attn]))
-    ff = Dense(ff_dim, activation="relu")(x)
-    ff = Dropout(dropout)(ff)
-    ff = Dense(feature_dim)(ff)
-    return LayerNormalization(epsilon=1e-6)(Add()([x, ff]))
-
-
-def build_transformer(input_shape, units=64, dropout=0.1, learning_rate=None, num_heads=4, num_blocks=2):
-    _require(_HAS_TF, "tensorflow", "the Transformer model")
-    inp = Input(shape=input_shape)
-    x = inp
-    for _ in range(max(1, num_blocks)):
-        x = _transformer_block(x, num_heads=num_heads, ff_dim=units, dropout=dropout)
-    x = GlobalAveragePooling1D()(x)
-    x = Dense(units, activation="relu")(x)
-    x = Dropout(dropout)(x)
-    out = Dense(1)(x)
-    return _compile(Model(inp, out, name="Transformer"), learning_rate)
-
-
 _SEQUENCE_BUILDERS = {
-    "LSTM": build_lstm, "GRU": build_gru, "BiLSTM": build_bilstm,
-    "AttentionLSTM": build_attention_lstm, "Transformer": build_transformer,
+    "LSTM": build_lstm, "GRU": build_gru,
 }
 SEQUENCE_MODELS = tuple(_SEQUENCE_BUILDERS)
 
@@ -515,7 +459,7 @@ def walk_forward_validation(df, preprocessor, model_type="XGBoost", n_splits=Non
             preds_scaled = model.predict(X_te.reshape(len(X_te), -1))
         elif model_type in SEQUENCE_MODELS:
             mp = model_params or {}
-            seq_kw = {k: mp[k] for k in ("units", "dropout", "learning_rate", "num_heads", "num_blocks") if k in mp}
+            seq_kw = {k: mp[k] for k in ("units", "dropout", "learning_rate") if k in mp}
             batch_size = mp.get("batch_size", config.batch_size)
             model = build_sequence_model(model_type, (X_tr.shape[1], X_tr.shape[2]), **seq_kw)
             model.fit(X_tr, y_tr, epochs=epochs, batch_size=batch_size,
@@ -575,7 +519,7 @@ class ChampionForecaster:
             self._model.fit(X.reshape(len(X), -1), y)
         elif model_type in SEQUENCE_MODELS:
             mp = model_params or {}
-            seq_kw = {k: mp[k] for k in ("units", "dropout", "learning_rate", "num_heads", "num_blocks") if k in mp}
+            seq_kw = {k: mp[k] for k in ("units", "dropout", "learning_rate") if k in mp}
             batch_size = mp.get("batch_size", self.config.batch_size)
             self._model = build_sequence_model(model_type, (X.shape[1], X.shape[2]), **seq_kw)
             self._model.fit(X, y, epochs=self.epochs, batch_size=batch_size,
