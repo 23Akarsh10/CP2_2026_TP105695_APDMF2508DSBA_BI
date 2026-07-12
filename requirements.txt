@@ -1,27 +1,44 @@
-# Stock Predictor — Python Dependencies
+# Stock Market DSS — Python Dependencies
+# =========================================
 # Install with: pip install -r requirements.txt
+#
+# NOTES
+# ─────
+# tensorflow   : If your machine has no GPU, replace with tensorflow-cpu.
+#                  pip install tensorflow-cpu>=2.14
+# optuna       : Optional but strongly recommended for run_tournament.py.
+#                  Without it, hyperparameter tuning falls back to
+#                  RandomizedSearchCV automatically — no code changes needed.
+# langchain-ollama : Requires Ollama installed separately (https://ollama.com)
+#                    and the Llama 3 model pulled locally:
+#                      ollama pull llama3
+#                    No API key needed — runs entirely on your own machine.
+#                    If Ollama is not running, the sentiment agent falls back
+#                    to a documented Neutral response gracefully.
 
-# Data
-yfinance>=0.2.38
-pandas>=2.0
+# ── Core scientific stack ────────────────────────────────────────────
 numpy>=1.24
+pandas>=2.0
 
-# Machine Learning
-scikit-learn>=1.3
+# ── Data ingestion ───────────────────────────────────────────────────
+yfinance>=0.2.38            # stock price data + KLSE index + MYR/USD FX
+
+# ── Machine learning ─────────────────────────────────────────────────
+scikit-learn>=1.3           # RobustScaler, TimeSeriesSplit, RandomizedSearchCV
 xgboost>=2.0
-tensorflow>=2.14        # use tensorflow-cpu if you do not have a GPU
+tensorflow>=2.14            # LSTM and GRU models
 
-# Hyperparameter Tuning & Explainability
-optuna>=3.6
-shap>=0.45
+# ── Hyperparameter optimisation ──────────────────────────────────────
+optuna>=3.6                 # Bayesian (TPE) search in run_tournament.py
 
-# News Ingestion & Local LLM Sentiment Agent
-feedparser>=6.0
-langchain-ollama>=0.1    # requires a running Ollama instance with a pulled model (e.g. llama3)
+# ── Explainability ───────────────────────────────────────────────────
+shap>=0.45                  # SHAP TreeExplainer on XGBoost
 
-# Caching
-joblib>=1.3
+# ── News ingestion and local AI sentiment agent ──────────────────────
+feedparser>=6.0             # RSS headline scraping
+langchain-ollama>=0.1       # connects Python to local Ollama / Llama 3
 
-# Dashboard
+# ── Dashboard and caching ────────────────────────────────────────────
 streamlit>=1.35
 plotly>=5.20
+joblib>=1.3                 # disk caching of tournament and forecast results

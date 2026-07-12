@@ -1,0 +1,434 @@
+{
+  "timestamp": "20260712_201809",
+  "n_splits": 5,
+  "stocks_run": [
+    "Maybank",
+    "CIMB",
+    "Public Bank",
+    "TNB",
+    "Petronas Chemicals",
+    "Maxis",
+    "Axiata",
+    "Genting",
+    "KL Kepong",
+    "IHH Healthcare"
+  ],
+  "stocks_skipped": [],
+  "per_stock": {
+    "Maybank": {
+      "results": {
+        "XGBoost": {
+          "avg_mae": 0.102320488916914,
+          "avg_acc": 0.5254054054054054,
+          "avg_sharpe": 0.7985340504846091
+        },
+        "LSTM": {
+          "avg_mae": 0.1642919959595131,
+          "avg_acc": 0.5145945945945946,
+          "avg_sharpe": 0.13535578033687182
+        },
+        "GRU": {
+          "avg_mae": 0.22217100978894214,
+          "avg_acc": 0.5308108108108109,
+          "avg_sharpe": 1.8728119237067649
+        }
+      },
+      "tuned_params": {
+        "XGBoost": {
+          "subsample": 0.7,
+          "reg_lambda": 2.0,
+          "n_estimators": 100,
+          "max_depth": 4,
+          "learning_rate": 0.01,
+          "colsample_bytree": 1.0
+        },
+        "LSTM": {
+          "units": 32,
+          "dropout": 0.3,
+          "batch_size": 16
+        },
+        "GRU": {
+          "units": 32,
+          "dropout": 0.3,
+          "batch_size": 16
+        }
+      }
+    },
+    "CIMB": {
+      "results": {
+        "XGBoost": {
+          "avg_mae": 0.13086410899279083,
+          "avg_acc": 0.5232432432432433,
+          "avg_sharpe": 0.7861861861232939
+        },
+        "LSTM": {
+          "avg_mae": 0.31433878829150597,
+          "avg_acc": 0.48540540540540544,
+          "avg_sharpe": -1.172316005911259
+        },
+        "GRU": {
+          "avg_mae": 0.27926589869882734,
+          "avg_acc": 0.4832432432432433,
+          "avg_sharpe": -0.07243701820200403
+        }
+      },
+      "tuned_params": {
+        "XGBoost": {
+          "subsample": 0.7,
+          "reg_lambda": 2.0,
+          "n_estimators": 100,
+          "max_depth": 4,
+          "learning_rate": 0.01,
+          "colsample_bytree": 1.0
+        },
+        "LSTM": {
+          "units": 32,
+          "dropout": 0.2,
+          "batch_size": 64
+        },
+        "GRU": {
+          "units": 32,
+          "dropout": 0.3,
+          "batch_size": 32
+        }
+      }
+    },
+    "Public Bank": {
+      "results": {
+        "XGBoost": {
+          "avg_mae": 0.06703791996715978,
+          "avg_acc": 0.5124324324324324,
+          "avg_sharpe": 0.9329203629785985
+        },
+        "LSTM": {
+          "avg_mae": 0.09475846145668279,
+          "avg_acc": 0.5037837837837837,
+          "avg_sharpe": -1.1138271763666645
+        },
+        "GRU": {
+          "avg_mae": 0.09269859388196029,
+          "avg_acc": 0.4583783783783784,
+          "avg_sharpe": -1.487381344664327
+        }
+      },
+      "tuned_params": {
+        "XGBoost": {
+          "subsample": 0.7,
+          "reg_lambda": 2.0,
+          "n_estimators": 100,
+          "max_depth": 4,
+          "learning_rate": 0.01,
+          "colsample_bytree": 1.0
+        },
+        "LSTM": {
+          "units": 96,
+          "dropout": 0.2,
+          "batch_size": 16
+        },
+        "GRU": {
+          "units": 96,
+          "dropout": 0.2,
+          "batch_size": 16
+        }
+      }
+    },
+    "TNB": {
+      "results": {
+        "XGBoost": {
+          "avg_mae": 0.2076388379264234,
+          "avg_acc": 0.5005405405405405,
+          "avg_sharpe": -0.663572105220415
+        },
+        "LSTM": {
+          "avg_mae": 0.3206613877768882,
+          "avg_acc": 0.5210810810810811,
+          "avg_sharpe": 0.4330005100689737
+        },
+        "GRU": {
+          "avg_mae": 0.3922690506582315,
+          "avg_acc": 0.534054054054054,
+          "avg_sharpe": 1.671473882129416
+        }
+      },
+      "tuned_params": {
+        "XGBoost": {
+          "subsample": 0.7,
+          "reg_lambda": 2.0,
+          "n_estimators": 100,
+          "max_depth": 4,
+          "learning_rate": 0.01,
+          "colsample_bytree": 1.0
+        },
+        "LSTM": {
+          "units": 32,
+          "dropout": 0.3,
+          "batch_size": 32
+        },
+        "GRU": {
+          "units": 96,
+          "dropout": 0.2,
+          "batch_size": 16
+        }
+      }
+    },
+    "Petronas Chemicals": {
+      "results": {
+        "XGBoost": {
+          "avg_mae": 0.19433948090833478,
+          "avg_acc": 0.48540540540540544,
+          "avg_sharpe": -0.7513723691686812
+        },
+        "LSTM": {
+          "avg_mae": 0.2781506440064746,
+          "avg_acc": 0.5275675675675676,
+          "avg_sharpe": 0.4636287874168025
+        },
+        "GRU": {
+          "avg_mae": 0.29872046990519674,
+          "avg_acc": 0.4972972972972974,
+          "avg_sharpe": -0.03348703425525286
+        }
+      },
+      "tuned_params": {
+        "XGBoost": {
+          "subsample": 0.7,
+          "reg_lambda": 2.0,
+          "n_estimators": 100,
+          "max_depth": 4,
+          "learning_rate": 0.01,
+          "colsample_bytree": 1.0
+        },
+        "LSTM": {
+          "units": 50,
+          "dropout": 0.2,
+          "batch_size": 64
+        },
+        "GRU": {
+          "units": 96,
+          "dropout": 0.2,
+          "batch_size": 16
+        }
+      }
+    },
+    "Maxis": {
+      "results": {
+        "XGBoost": {
+          "avg_mae": 0.0741552476456651,
+          "avg_acc": 0.5567567567567568,
+          "avg_sharpe": 1.8909723173638073
+        },
+        "LSTM": {
+          "avg_mae": 0.10446215440349445,
+          "avg_acc": 0.5102702702702703,
+          "avg_sharpe": 1.0258969414990657
+        },
+        "GRU": {
+          "avg_mae": 0.11138834122109897,
+          "avg_acc": 0.5372972972972974,
+          "avg_sharpe": 0.8595217602885574
+        }
+      },
+      "tuned_params": {
+        "XGBoost": {
+          "subsample": 0.7,
+          "reg_lambda": 2.0,
+          "n_estimators": 100,
+          "max_depth": 4,
+          "learning_rate": 0.01,
+          "colsample_bytree": 1.0
+        },
+        "LSTM": {
+          "units": 32,
+          "dropout": 0.2,
+          "batch_size": 64
+        },
+        "GRU": {
+          "units": 96,
+          "dropout": 0.2,
+          "batch_size": 16
+        }
+      }
+    },
+    "Axiata": {
+      "results": {
+        "XGBoost": {
+          "avg_mae": 0.06995159118199631,
+          "avg_acc": 0.4962162162162162,
+          "avg_sharpe": 0.5363343425962703
+        },
+        "LSTM": {
+          "avg_mae": 0.08422559542716881,
+          "avg_acc": 0.4756756756756757,
+          "avg_sharpe": -0.6045861954792388
+        },
+        "GRU": {
+          "avg_mae": 0.0968539706641646,
+          "avg_acc": 0.5156756756756757,
+          "avg_sharpe": 1.0188036907369153
+        }
+      },
+      "tuned_params": {
+        "XGBoost": {
+          "subsample": 0.7,
+          "reg_lambda": 2.0,
+          "n_estimators": 100,
+          "max_depth": 4,
+          "learning_rate": 0.01,
+          "colsample_bytree": 1.0
+        },
+        "LSTM": {
+          "units": 32,
+          "dropout": 0.3,
+          "batch_size": 16
+        },
+        "GRU": {
+          "units": 32,
+          "dropout": 0.3,
+          "batch_size": 16
+        }
+      }
+    },
+    "Genting": {
+      "results": {
+        "XGBoost": {
+          "avg_mae": 0.0920391317863242,
+          "avg_acc": 0.4864864864864865,
+          "avg_sharpe": -0.35583663829833695
+        },
+        "LSTM": {
+          "avg_mae": 0.13166186407486505,
+          "avg_acc": 0.4843243243243244,
+          "avg_sharpe": -0.9292589170397031
+        },
+        "GRU": {
+          "avg_mae": 0.12917778433183819,
+          "avg_acc": 0.5091891891891892,
+          "avg_sharpe": 0.5954040735782004
+        }
+      },
+      "tuned_params": {
+        "XGBoost": {
+          "subsample": 0.7,
+          "reg_lambda": 2.0,
+          "n_estimators": 100,
+          "max_depth": 4,
+          "learning_rate": 0.01,
+          "colsample_bytree": 1.0
+        },
+        "LSTM": {
+          "units": 32,
+          "dropout": 0.2,
+          "batch_size": 64
+        },
+        "GRU": {
+          "units": 50,
+          "dropout": 0.2,
+          "batch_size": 64
+        }
+      }
+    },
+    "KL Kepong": {
+      "results": {
+        "XGBoost": {
+          "avg_mae": 0.4407444473806853,
+          "avg_acc": 0.5513513513513513,
+          "avg_sharpe": 2.212183822985808
+        },
+        "LSTM": {
+          "avg_mae": 0.4565859304778616,
+          "avg_acc": 0.5351351351351352,
+          "avg_sharpe": 0.6301379076047458
+        },
+        "GRU": {
+          "avg_mae": 0.5975627075772963,
+          "avg_acc": 0.5178378378378379,
+          "avg_sharpe": 0.7347267859527469
+        }
+      },
+      "tuned_params": {
+        "XGBoost": {
+          "subsample": 0.7,
+          "reg_lambda": 1.0,
+          "n_estimators": 100,
+          "max_depth": 5,
+          "learning_rate": 0.01,
+          "colsample_bytree": 1.0
+        },
+        "LSTM": {
+          "units": 96,
+          "dropout": 0.2,
+          "batch_size": 16
+        },
+        "GRU": {
+          "units": 32,
+          "dropout": 0.3,
+          "batch_size": 16
+        }
+      }
+    },
+    "IHH Healthcare": {
+      "results": {
+        "XGBoost": {
+          "avg_mae": 0.1027923621345995,
+          "avg_acc": 0.46270270270270275,
+          "avg_sharpe": -1.511771160914769
+        },
+        "LSTM": {
+          "avg_mae": 0.19862035218280105,
+          "avg_acc": 0.46378378378378377,
+          "avg_sharpe": -0.24344850464446038
+        },
+        "GRU": {
+          "avg_mae": 0.3378255396193557,
+          "avg_acc": 0.5200000000000001,
+          "avg_sharpe": 0.8198589189664924
+        }
+      },
+      "tuned_params": {
+        "XGBoost": {
+          "subsample": 0.7,
+          "reg_lambda": 2.0,
+          "n_estimators": 100,
+          "max_depth": 4,
+          "learning_rate": 0.01,
+          "colsample_bytree": 1.0
+        },
+        "LSTM": {
+          "units": 96,
+          "dropout": 0.2,
+          "batch_size": 16
+        },
+        "GRU": {
+          "units": 96,
+          "dropout": 0.2,
+          "batch_size": 16
+        }
+      }
+    }
+  },
+  "avg_mae_by_model": {
+    "XGBoost": 0.1481883616840893,
+    "LSTM": 0.21477571740572557,
+    "GRU": 0.2557933366346912
+  },
+  "avg_acc_by_model": {
+    "XGBoost": 0.510054054054054,
+    "LSTM": 0.5021621621621623,
+    "GRU": 0.5103783783783785
+  },
+  "avg_sharpe_by_model": {
+    "XGBoost": 0.38745788089301847,
+    "LSTM": -0.13754168725148658,
+    "GRU": 0.5979295638237508
+  },
+  "champion": "XGBoost",
+  "champion_params_source_stock": "Public Bank",
+  "champion_params": {
+    "subsample": 0.7,
+    "reg_lambda": 2.0,
+    "n_estimators": 100,
+    "max_depth": 4,
+    "learning_rate": 0.01,
+    "colsample_bytree": 1.0
+  }
+}

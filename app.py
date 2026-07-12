@@ -20,28 +20,20 @@ from engine_final import (
     run_sentiment_agent,
     stop_loss_advisory,
     get_current_session_label,
+    BURSA_10,
+    CONFIG,
 )
 
-# ═══════════════════════════════════════════════════════════════════
-# STOCK UNIVERSE
-# ═══════════════════════════════════════════════════════════════════
-# 10 highly liquid Bursa Malaysia stocks. Keys are display names used
-# throughout the dashboard and passed to run_sentiment_agent() as the
-# company_name for headline matching; values are Yahoo Finance tickers.
 
-BURSA_10 = {
-    "Maybank":            "1155.KL",
-    "CIMB":                "1023.KL",
-    "Public Bank":         "1295.KL",
-    "TNB":                 "5347.KL",
-    "Petronas Chemicals":  "5183.KL",
-    "Maxis":               "6012.KL",
-    "Axiata":              "6888.KL",
-    "Genting":             "3182.KL",
-    "KL Kepong":           "2445.KL",
-    "IHH Healthcare":      "5225.KL",
+CHAMPION_MODEL = "XGBoost"
+CHAMPION_PARAMS = {
+    "subsample": 0.7,
+    "reg_lambda": 2.0,
+    "n_estimators": 100,
+    "max_depth": 4,
+    "learning_rate": 0.01,
+    "colsample_bytree": 1.0
 }
-
 
 # ═══════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -137,50 +129,8 @@ def _trend_label(exp_return: float) -> str:
     """Bullish if expected return is positive, Bearish if negative."""
     return "Bullish" if exp_return >= 0 else "Bearish"
 
-
-# ═══════════════════════════════════════════════════════════════════
-# CACHING
-# ═══════════════════════════════════════════════════════════════════
-# The engine is split into two independently cached stages so that
-# model SELECTION (comparing XGBoost, LSTM and GRU) only ever runs
-# once per stock, while model FORECASTING (retraining and running
-# just the champion) refreshes on each session checkpoint.
-#
-#   Stage A - select_champion_model()
-#       Runs walk-forward validation for all 3 candidate models and
-#       picks the champion (lowest MAE). Cached to disk keyed ONLY by
-#       symbol, so it is not repeated on every session or app restart.
-#       It only reruns if its cache file is removed (see the
-#       "Rebuild model selection" button in the sidebar).
-#
-#   Stage B - run_champion_forecast()
-#       Retrains ONLY the already-selected champion model on the
-#       latest available data and produces the 5-day forecast. Cached
-#       to disk keyed by (symbol, session_label), so it refreshes once
-#       per checkpoint (morning / half_day / end_of_day) as new data
-#       is collected, without re-running the other two algorithms.
-#
-# TWO LAYERS for each stage:
-#   1. st.cache_resource - in-memory, avoids recompute on Streamlit
-#      reruns WITHIN the same running process (e.g. widget interaction).
-#   2. Disk cache (joblib) - survives a full process restart (dev
-#      server restart, redeploy, Streamlit Cloud sleep/wake).
-#
-# Neither stage returns a trained model object (XGBoost/Keras models
-# are created and used internally, then discarded) - only plain
-# numpy/dict/string results - so a lightweight joblib dump/load is
-# enough; there is no need to serialize model binaries.
-
-MODEL_SELECTION_CACHE_DIR = Path("model_selection_cache")
-MODEL_SELECTION_CACHE_DIR.mkdir(exist_ok=True)
-
 ENGINE_CACHE_DIR = Path("engine_cache")
 ENGINE_CACHE_DIR.mkdir(exist_ok=True)
-
-
-def _selection_cache_path(symbol: str) -> Path:
-    safe_symbol = symbol.replace(".", "_")
-    return MODEL_SELECTION_CACHE_DIR / f"{safe_symbol}.joblib"
 
 
 def _forecast_cache_path(symbol: str, session_label: str) -> Path:
@@ -197,79 +147,33 @@ def load_stock_data(symbol: str, session_label: str):
 
 
 @st.cache_resource(show_spinner=False)
-def select_champion_model(symbol: str, _df):
-    """
-    Stage A - runs ONCE per stock, not once per session.
-
-    Runs leakage-free walk-forward validation for all 3 base models
-    (XGBoost, LSTM, GRU) and selects the champion (lowest MAE). This
-    comparison is expensive and does not need to be repeated every
-    time new data is collected; the champion architecture, once
-    chosen, is reused going forward.
-
-    Disk-cached per symbol only (no session_label in the key): if a
-    selection already exists on disk, it is loaded instead of
-    re-running all three algorithms. Use "Rebuild model selection" in
-    the sidebar to force this to run again.
-    """
-    cache_path = _selection_cache_path(symbol)
-
-    if cache_path.exists():
-        try:
-            return joblib.load(cache_path)
-        except Exception:
-            pass  # corrupt/incompatible cache file - fall through and rerun
-
-    proc = StockPreprocessor()
-
-    results = {}
-    for mtype in ["XGBoost", "LSTM", "GRU"]:
-        results[mtype] = walk_forward_validation(_df, proc, model_type=mtype, n_splits=5)
-
-    champion = min(results, key=lambda k: results[k]["avg_mae"])
-
-    output = (results, champion)
-    try:
-        joblib.dump(output, cache_path)
-    except Exception:
-        pass  # disk cache is a bonus, not required for the app to work
-
-    return output
-
-
-@st.cache_resource(show_spinner=False)
-def run_champion_forecast(symbol: str, session_label: str, _df, champion: str):
-    """
-    Stage B - runs once per session checkpoint.
-
-    Retrains ONLY the already-selected champion model on the latest
-    available data and generates the 5-day forecast. The other two
-    algorithms are not touched here; model selection is handled
-    separately by select_champion_model() above.
-
-    Note: prepare_data() fits a scaler on all available data - this is
-    the one place that is appropriate, since the champion is being
-    retrained on the full, latest dataset for forecasting rather than
-    being evaluated fold-by-fold.
-
-    Disk-cached per (symbol, session_label): if a checkpoint's result
-    already exists on disk, it is loaded instead of retraining.
-    """
+def run_champion_forecast(symbol: str, session_label: str, _df):
     cache_path = _forecast_cache_path(symbol, session_label)
 
     if cache_path.exists():
         try:
-            return joblib.load(cache_path)
+            cached = joblib.load(cache_path)
+            # Guards against a stale cache file left over from an older,
+            # incompatible version of this pipeline (e.g. the previous
+            # recursive-forecast design) - a mismatched shape here means
+            # the cache predates the current output format, not that
+            # anything is actually wrong with the data.
+            if isinstance(cached, tuple) and len(cached) == 3:
+                return cached
         except Exception:
             pass  # corrupt/incompatible cache file - fall through and retrain
 
     proc = StockPreprocessor()
     X, y, scaled = proc.prepare_data(_df)
     champ = ChampionForecaster(proc)
-    champ.fit(X, y, scaled, champion, raw_df=_df)
+    champ.fit(X, y, scaled, CHAMPION_MODEL, raw_df=_df, model_params=CHAMPION_PARAMS)
     forecast_5 = champ.forecast(n_days=5)
 
-    output = (forecast_5, proc)
+    wf_result = walk_forward_validation(
+        _df, StockPreprocessor(), model_type=CHAMPION_MODEL,
+        n_splits=5, model_params=CHAMPION_PARAMS)
+
+    output = (forecast_5, proc, wf_result)
     try:
         joblib.dump(output, cache_path)
     except Exception:
@@ -301,8 +205,7 @@ def build_stock_row(idx: int, name: str, symbol: str,
     """
     try:
         df = load_stock_data(symbol, session_label)
-        results, champion = select_champion_model(symbol, df)
-        fc5, proc = run_champion_forecast(symbol, session_label, df, champion)
+        fc5, proc, wf_result = run_champion_forecast(symbol, session_label, df)
         sentiment = load_sentiment(symbol, name, session_label)
 
         last_close = float(df["Close"].iloc[-1])
@@ -312,7 +215,6 @@ def build_stock_row(idx: int, name: str, symbol: str,
         sent_label = sentiment["sentiment_label"]
         action     = _suggested_action(
                          exp_return, sent_label, sl_info["breached"])
-        best       = results[champion]
 
         return {
             "No.":              idx,
@@ -326,11 +228,10 @@ def build_stock_row(idx: int, name: str, symbol: str,
             # Hidden — used in deep dive tab
             "_symbol":          symbol,
             "_forecast":        fc5,
-            "_champion":        champion,
-            "_mae":             round(best["avg_mae"],    4),
-            "_da":              round(best["avg_acc"]*100, 1),
-            "_actuals_rm":      best["actuals_rm"],
-            "_preds_rm":        best["predictions_rm"],
+            "_mae":             round(wf_result["avg_mae"],    4),
+            "_da":              round(wf_result["avg_acc"]*100, 1),
+            "_actuals_rm":      wf_result["actuals_rm"],
+            "_preds_rm":        wf_result["predictions_rm"],
             "_sl_threshold":    sl_info["threshold"],
             "_sl_breached":     sl_info["breached"],
             "_sl_advisory":     sl_info["advisory"],
@@ -369,7 +270,7 @@ pipeline_stages = [
     "Data Preprocessing and Feature Engineering",
     "Dataset Preparation",
     "Model Development and Hyperparameter Optimisation",
-    "Model Evaluation and Explainability",
+    "Model Evaluation and Selection",
     "Model Selection and Forecasting",
     "AI Based Market Intelligence",
     "Investment Decision Support",
@@ -396,19 +297,6 @@ if st.sidebar.button("Refresh forecast (new session data)"):
         f.unlink()
     st.rerun()
 
-if st.sidebar.button("Rebuild model selection (all algorithms)"):
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    for f in ENGINE_CACHE_DIR.glob("*.joblib"):
-        f.unlink()
-    for f in MODEL_SELECTION_CACHE_DIR.glob("*.joblib"):
-        f.unlink()
-    st.rerun()
-st.sidebar.caption(
-    "Refresh forecast retrains only the selected champion model on "
-    "the latest data. Rebuild model selection re-compares all three "
-    "algorithms and should rarely be needed.")
-
 
 # ═══════════════════════════════════════════════════════════════════
 # TABS
@@ -427,13 +315,16 @@ with tab_overview:
 
     st.header("Market Overview - Bursa Malaysia Top 10")
     st.caption(
-        "All 10 stocks processed through the quantitative engine. "
-        "Champion model selected per stock by lowest walk-forward MAE "
-        "(leakage-free, per-fold scaling). Sentiment and its reason are "
-        "generated locally by a Llama 3 agent reading live news and "
-        "macro indicators. Suggested action combines forecast "
-        "direction, sentiment, and stop-loss signal. Results refresh "
-        "once per session checkpoint (morning / half-day / end-of-day).")
+        f"All 10 stocks processed through the quantitative engine using "
+        f"the champion model ({CHAMPION_MODEL}), selected offline via a "
+        f"manual tournament that hyperparameter-tuned and compared "
+        f"XGBoost, LSTM and GRU on leakage-free walk-forward MAE, "
+        f"Directional Accuracy, and Sharpe Ratio (see run_tournament.py). "
+        f"Sentiment and its reason are generated "
+        f"locally by a Llama 3 agent reading live news and macro "
+        f"indicators. Suggested action combines forecast direction, "
+        f"sentiment, and stop-loss signal. Results refresh once per "
+        f"session checkpoint (morning / half-day / end-of-day).")
 
     rows        = []
     stock_cache = {}
@@ -516,8 +407,7 @@ with tab_dive:
 
     with st.spinner(f"Running engine for {selected_name}..."):
         df = load_stock_data(symbol, session_label)
-        results, champion = select_champion_model(symbol, df)
-        fc5, proc = run_champion_forecast(symbol, session_label, df, champion)
+        fc5, proc, wf_result = run_champion_forecast(symbol, session_label, df)
         sentiment = load_sentiment(symbol, selected_name, session_label)
 
     last_close = float(df["Close"].iloc[-1])
@@ -526,11 +416,11 @@ with tab_dive:
     sent_label = sentiment["sentiment_label"]
     action     = _suggested_action(
                      exp_return, sent_label, sl_info["breached"])
-    best       = results[champion]
-    da         = round(best["avg_acc"] * 100, 1)
-    mae        = round(best["avg_mae"], 4)
-    actuals_rm = best["actuals_rm"]
-    preds_rm   = best["predictions_rm"]
+    da         = round(wf_result["avg_acc"] * 100, 1)
+    mae        = round(wf_result["avg_mae"], 4)
+    sharpe     = round(wf_result["avg_sharpe"], 3)
+    actuals_rm = wf_result["actuals_rm"]
+    preds_rm   = wf_result["predictions_rm"]
 
     # -- Section 1: Projected vs Actual line chart -----------------
     st.subheader("Projected vs Actual Prices")
@@ -548,9 +438,13 @@ with tab_dive:
     n_bt = min(len(actuals_rm), 60)
     x_bt = list(range(n_hist - n_bt, n_hist))
 
-    # Forecast continues from today
-    x_fc = list(range(n_hist - 1, n_hist + len(fc5)))
-    fc_y = np.concatenate([[hist_close[-1]], fc5])
+    # Forecast is now a single DIRECT forecast_horizon-day-ahead price
+    # (ChampionForecaster no longer produces a day-by-day recursive
+    # trajectory - see engine_final.py), so the chart draws one line
+    # segment from today straight to that horizon point, rather than
+    # plotting intermediate days that were never actually predicted.
+    x_fc = [n_hist - 1, n_hist - 1 + CONFIG.forecast_horizon]
+    fc_y = [hist_close[-1], float(fc5[-1])]
 
     fig = go.Figure()
 
@@ -561,7 +455,7 @@ with tab_dive:
 
     fig.add_trace(go.Scatter(
         x=x_bt, y=preds_rm[-n_bt:],
-        name=f"{champion} Back-test",
+        name=f"{CHAMPION_MODEL} Back-test",
         line=dict(color="#f59e0b", width=1.5, dash="dot")))
 
     fig.add_trace(go.Scatter(
@@ -593,13 +487,39 @@ with tab_dive:
     # -- Section 2: Model info widget -------------------------------
     st.subheader("Model Information")
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Champion Model", champion)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Champion Model", CHAMPION_MODEL)
     m2.metric("Directional Accuracy", f"{da}%",
               help="% of steps where model predicted correct direction "
-                   "(leakage-free, RM-scale evaluation)")
+                   "(leakage-free, RM-scale evaluation). Also used, "
+                   "alongside MAE and Sharpe Ratio, when selecting the "
+                   "champion architecture offline in run_tournament.py.")
     m3.metric("MAE", f"RM {mae}",
-              help="Mean Absolute Error in Ringgit - lower is better")
+              help="Mean Absolute Error in Ringgit - lower is better. "
+                   "Also used, alongside Directional Accuracy and Sharpe "
+                   "Ratio, when selecting the champion architecture "
+                   "offline in run_tournament.py.")
+    m4.metric("Sharpe Ratio", f"{sharpe}",
+              help="Annualised risk-adjusted return of a long/short "
+                   "strategy driven by the model's directional signal "
+                   "(approximation - ignores transaction costs). Also "
+                   "used, alongside MAE and Directional Accuracy, when "
+                   "selecting the champion architecture offline in "
+                   "run_tournament.py.")
+
+    with st.expander("Champion Hyperparameters"):
+        st.caption(
+            f"{CHAMPION_MODEL} is the hardcoded champion architecture. "
+            "Its hyperparameters below were found via a manual, offline "
+            "tournament (Optuna, falling back to RandomizedSearchCV if "
+            "Optuna is unavailable) that compared XGBoost, LSTM and GRU "
+            "on leakage-safe walk-forward validation, selecting the "
+            "champion on a weighted composite of MAE, Directional "
+            "Accuracy, and Sharpe Ratio - "
+            "see run_tournament.py. That comparison is not repeated here; "
+            "the app only ever trains and runs this one architecture.")
+        st.markdown(f"**{CHAMPION_MODEL}**")
+        st.json(CHAMPION_PARAMS)
 
     # Loss prevention rules
     st.markdown("**Loss Prevention Rules**")
@@ -619,12 +539,18 @@ with tab_dive:
         unsafe_allow_html=True)
 
     st.caption(
-        "Champion model selected by choosing the one with the lowest MAE across 5-fold walk-forward "
-        "validation, with a fresh scaler fit per fold to avoid data "
-        "leakage. Directional accuracy measures whether the model "
-        "correctly predicted price direction (up/down) at each step, "
-        "anchored to the previous actual close. Stop-loss threshold "
-        "is adjustable in the sidebar.")
+        f"{CHAMPION_MODEL} is hardcoded as the champion, chosen offline "
+        f"via a manual tournament (run_tournament.py) that compared it "
+        f"against LSTM and GRU on 5-fold walk-forward MAE, Directional "
+        f"Accuracy, and Sharpe Ratio, with a fresh scaler fit per fold "
+        f"to avoid data leakage. "
+        f"The metrics above are from validating just this champion on "
+        f"the current stock. Directional accuracy measures whether the "
+        f"model correctly predicted price direction (up/down) at each "
+        f"step, anchored to the previous actual close. Sharpe Ratio is "
+        f"the annualised risk-adjusted return of a signal driven by "
+        f"that direction. Stop-loss threshold is adjustable in the "
+        f"sidebar.")
 
     # -- Section 3: Sentiment (local Llama 3 agent) -----------------
     st.markdown("---")
