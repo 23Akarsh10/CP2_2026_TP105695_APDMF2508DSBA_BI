@@ -1,5 +1,6 @@
 import os
 import warnings
+from datetime import datetime
 os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 warnings.filterwarnings("ignore")
@@ -314,6 +315,7 @@ tab_overview, tab_dive = st.tabs([
 with tab_overview:
 
     st.header("Market Overview - Bursa Malaysia Top 10")
+    st.caption(f"Data as of {datetime.now().strftime('%d/%m/%Y at %H:%M')}")
     st.caption(
         f"All 10 stocks processed through the quantitative engine using "
         f"the champion model ({CHAMPION_MODEL}), selected offline via a "
@@ -402,6 +404,7 @@ with tab_overview:
 with tab_dive:
 
     st.header(f"{selected_name} - Deep Dive")
+    st.caption(f"Data as of {datetime.now().strftime('%d/%m/%Y at %H:%M')}")
 
     symbol = BURSA_10[selected_name]
 
