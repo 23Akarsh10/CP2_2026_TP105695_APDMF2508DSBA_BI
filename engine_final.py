@@ -161,16 +161,16 @@ BURSA_10 = {
 }
 
 COMPANY_ALIASES = {
-    "Maybank":            ["maybank", "malayan banking", "mbb", "1155", "1155.kl"],
-    "CIMB":               ["cimb", "cimb group", "1023", "1023.kl"],
-    "Public Bank":        ["public bank", "pbbank", "pbb", "1295", "1295.kl"],
-    "TNB":                ["tenaga", "tenaga nasional", "tnb", "5347", "5347.kl"],
-    "Petronas Chemicals": ["petronas chemicals", "petchem", "5183", "5183.kl"],
-    "Maxis":              ["maxis", "maxis berhad", "6012", "6012.kl"],
-    "Axiata":             ["axiata", "axiata group", "6888", "6888.kl"],
-    "Genting":            ["genting", "genting berhad", "genting bhd", "3182", "3182.kl"],
-    "KL Kepong":          ["kl kepong", "klk", "kuala lumpur kepong", "2445", "2445.kl"],
-    "IHH Healthcare":     ["ihh", "ihh healthcare", "5225", "5225.kl"],
+    "Maybank":            ["maybank", "malayan banking", "mbb", "1155.kl"],
+    "CIMB":               ["cimb", "cimb group", "1023.kl"],
+    "Public Bank":        ["public bank", "pbbank", "pbb", "1295.kl"],
+    "TNB":                ["tenaga", "tenaga nasional", "tnb", "5347.kl"],
+    "Petronas Chemicals": ["petronas chemicals", "petchem", "5183.kl"],
+    "Maxis":              ["maxis", "maxis berhad", "6012.kl"],
+    "Axiata":             ["axiata", "axiata group", "6888.kl"],
+    "Genting":            ["genting", "genting berhad", "genting bhd", "3182.kl"],
+    "KL Kepong":          ["kl kepong", "klk", "kuala lumpur kepong", "2445.kl"],
+    "IHH Healthcare":     ["ihh", "ihh healthcare", "5225.kl"],
 }
 
 
@@ -765,8 +765,19 @@ def _aliases_for(company_name, aliases=None):
 
 
 def _fuzzy_contains(title_lower, term, threshold):
-    if term in title_lower:
+    # Word-boundary substring match, not a bare `in` check - otherwise a
+    # short term like a ticker code can match as a coincidental fragment
+    # of an unrelated number or word in the headline (e.g. "5183" inside
+    # a Ringgit figure or resignation count that has nothing to do with
+    # that company).
+    if re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", title_lower):
         return True
+    # The fuzzy fallback is only meaningful for terms long enough that a
+    # high SequenceMatcher ratio actually implies relatedness. Short
+    # terms (e.g. 3-letter tickers) can hit that ratio against unrelated
+    # short words by chance, so skip fuzzy matching for them entirely.
+    if len(term) < 5:
+        return False
     for token in re.findall(r"[a-z0-9.]+", title_lower):
         if SequenceMatcher(None, token, term).ratio() >= threshold:
             return True
@@ -865,6 +876,42 @@ def _default_neutral_response():
     return {"sentiment_label": "Neutral", "macro_impact": msg, "qualitative_rationale": msg}
 
 
+_NEGATIVE_RATIONALE_WORDS = (
+    "decline", "declining", "fall", "falling", "drop", "dropping", "loss",
+    "losses", "weak", "weaken", "weakening", "risk", "risks", "risky",
+    "shortage", "shortages", "exodus", "concern", "concerns", "negative",
+    "negatively", "hurt", "hurting", "harm", "harmful", "downturn",
+    "cut", "cuts", "reduced", "reduce", "reducing", "slowdown", "strain",
+    "pressure", "pressured", "underperform", "warn", "warns", "warning",
+)
+_POSITIVE_RATIONALE_WORDS = (
+    "growth", "growing", "grow", "rise", "rising", "rose", "gain",
+    "gains", "strong", "strengthen", "strengthening", "positive",
+    "positively", "boost", "boosting", "improve", "improving",
+    "improvement", "record", "surge", "surging", "expansion",
+    "expanding", "upgrade", "upgraded", "outperform", "beat", "beats",
+)
+
+
+def _label_consistent_with_rationale(label, rationale):
+    """
+    Cheap safety net for the (fairly common) failure mode where a small
+    local LLM writes a rationale with a clear negative or positive tone
+    but fills sentiment_label with an unrelated/default value. Not a
+    substitute for a good prompt - just a backstop that flags obvious
+    mismatches so we don't silently show contradictory text next to
+    each other in the UI.
+    """
+    text = rationale.lower()
+    neg_hits = sum(1 for w in _NEGATIVE_RATIONALE_WORDS if w in text)
+    pos_hits = sum(1 for w in _POSITIVE_RATIONALE_WORDS if w in text)
+    if neg_hits >= 2 and neg_hits > pos_hits and label != "Negative":
+        return False
+    if pos_hits >= 2 and pos_hits > neg_hits and label != "Positive":
+        return False
+    return True
+
+
 def run_sentiment_agent(ticker, company_name, config=CONFIG):
     try:
         context = build_agent_context(company_name, config)
@@ -875,12 +922,21 @@ def run_sentiment_agent(ticker, company_name, config=CONFIG):
     if not headlines:
         return _default_neutral_response()
     headline_block = "\n".join(f"- {h}" for h in headlines)
+    # The label is asked for LAST and explicitly tied to the rationale,
+    # rather than as an independent field the model can fill in without
+    # regard to what it just wrote - this is what was causing the label
+    # to disagree with the rationale's actual tone.
     prompt = f"""You are an elite Financial Intelligence Analyst.
 Company: {company_name}
 Headlines:
 {headline_block}
 Macro: OPR={macro['OPR']}% CPI={macro['CPI']}% GDP={macro['GDP_Growth']}%
-Respond with ONLY JSON: sentiment_label, macro_impact, qualitative_rationale"""
+
+Step 1: Write "macro_impact" - a short assessment of how these macro figures affect this specific company.
+Step 2: Write "qualitative_rationale" - a short assessment of how these specific headlines affect this specific company.
+Step 3: Read back what you wrote in Step 2. If it describes a net negative effect on the company, sentiment_label must be "Negative". If it describes a net positive effect, sentiment_label must be "Positive". Only use "Neutral" if the effect is genuinely mixed or unclear.
+
+Respond with ONLY JSON with exactly these keys, in this order: macro_impact, qualitative_rationale, sentiment_label"""
     if not _HAS_OLLAMA:
         return _default_neutral_response()
     try:
@@ -895,9 +951,15 @@ Respond with ONLY JSON: sentiment_label, macro_impact, qualitative_rationale"""
     label = parsed.get("sentiment_label", "Neutral")
     if label not in ("Positive", "Negative", "Neutral"):
         label = "Neutral"
+    rationale = parsed.get("qualitative_rationale", "No qualitative rationale available.")
+    if not _label_consistent_with_rationale(label, rationale):
+        text = rationale.lower()
+        neg_hits = sum(1 for w in _NEGATIVE_RATIONALE_WORDS if w in text)
+        pos_hits = sum(1 for w in _POSITIVE_RATIONALE_WORDS if w in text)
+        label = "Negative" if neg_hits > pos_hits else "Positive"
     return {"sentiment_label": label,
             "macro_impact": parsed.get("macro_impact", "No macro impact assessment available."),
-            "qualitative_rationale": parsed.get("qualitative_rationale", "No qualitative rationale available.")}
+            "qualitative_rationale": rationale}
 
 
 HALF_DAY_CUTOFF = CONFIG.half_day_cutoff
