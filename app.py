@@ -104,9 +104,9 @@ ACTION_COLOUR = {
 
 
 def _suggested_action(exp_return: float, sentiment: str,
-                       stop_breached: bool) -> str:
+                       stop_breached: bool) -> tuple[str, str]:
     """
-    Derives a suggested action from three signals:
+    Derives a suggested action from three independent signals:
       - Expected 5-day return (quantitative)
       - Sentiment label (qualitative, from the local Llama 3 agent)
       - Stop-loss breach flag (risk management)
@@ -116,14 +116,24 @@ def _suggested_action(exp_return: float, sentiment: str,
       If return > 1% and sentiment is Positive        : Buy
       If return < -1% or sentiment is Negative        : Sell
       Otherwise                                        : Hold
+
+    Returns (action, reason) so the UI can show *why* the action was
+    triggered - since these three signals are independent, "Sell" can
+    fire from negative return/sentiment alone, with no stop-loss breach
+    at all. Surfacing the reason avoids that looking like a
+    contradiction next to the stop-loss advisory panel.
     """
     if stop_breached:
-        return "Sell"
+        return "Sell", "stop-loss breached"
     if exp_return > 1.0 and sentiment == "Positive":
-        return "Buy"
-    if exp_return < -1.0 or sentiment == "Negative":
-        return "Sell"
-    return "Hold"
+        return "Buy", "positive forecast and sentiment"
+    if exp_return < -1.0 and sentiment == "Negative":
+        return "Sell", "negative forecast and sentiment"
+    if exp_return < -1.0:
+        return "Sell", "negative forecast"
+    if sentiment == "Negative":
+        return "Sell", "negative sentiment"
+    return "Hold", "no strong signal"
 
 
 def _trend_label(exp_return: float) -> str:
@@ -198,11 +208,16 @@ def load_sentiment(symbol: str, company_name: str, session_label: str):
 # ═══════════════════════════════════════════════════════════════════
 
 def build_stock_row(idx: int, name: str, symbol: str,
-                    session_label: str) -> dict | None:
+                    session_label: str, stop_loss_pct: float = 0.05) -> dict | None:
     """
     Runs the full pipeline for one stock and returns a dict
     with all columns needed for the Market Overview table.
     Returns None if data cannot be fetched.
+
+    stop_loss_pct is threaded through from the sidebar slider so the
+    Market Overview table and Deep Dive tab always agree on the
+    breach status for a given stock, instead of Market Overview
+    silently using a hardcoded 5% regardless of the slider.
     """
     try:
         df = load_stock_data(symbol, session_label)
@@ -211,10 +226,10 @@ def build_stock_row(idx: int, name: str, symbol: str,
 
         last_close = float(df["Close"].iloc[-1])
         exp_return = (float(fc5[-1]) - last_close) / last_close * 100
-        sl_info    = stop_loss_advisory(last_close, fc5, 0.05)
+        sl_info    = stop_loss_advisory(last_close, fc5, stop_loss_pct)
         trend      = _trend_label(exp_return)
         sent_label = sentiment["sentiment_label"]
-        action     = _suggested_action(
+        action, action_reason = _suggested_action(
                          exp_return, sent_label, sl_info["breached"])
 
         return {
@@ -226,6 +241,7 @@ def build_stock_row(idx: int, name: str, symbol: str,
             "Sentiment":        sent_label,
             "Sentiment Reason": sentiment["qualitative_rationale"],
             "Suggested Action": action,
+            "Action Reason":    action_reason,
             # Hidden — used in deep dive tab
             "_symbol":          symbol,
             "_forecast":        fc5,
@@ -336,7 +352,7 @@ with tab_overview:
         progress.progress(
             (i + 1) / len(BURSA_10),
             text=f"Processing {name}...")
-        row = build_stock_row(i + 1, name, symbol, session_label)
+        row = build_stock_row(i + 1, name, symbol, session_label, stop_loss_pct)
         if row:
             stock_cache[name] = row
             rows.append({
@@ -347,6 +363,7 @@ with tab_overview:
                 "Sentiment":         row["Sentiment"],
                 "Sentiment Reason":  row["Sentiment Reason"],
                 "Suggested Action":  row["Suggested Action"],
+                "Action Reason":     row["Action Reason"],
             })
     progress.empty()
 
@@ -417,7 +434,7 @@ with tab_dive:
     exp_return = (float(fc5[-1]) - last_close) / last_close * 100
     sl_info    = stop_loss_advisory(last_close, fc5, stop_loss_pct)
     sent_label = sentiment["sentiment_label"]
-    action     = _suggested_action(
+    action, action_reason = _suggested_action(
                      exp_return, sent_label, sl_info["breached"])
     da         = round(wf_result["avg_acc"] * 100, 1)
     mae        = round(wf_result["avg_mae"], 4)
@@ -534,7 +551,8 @@ with tab_dive:
         f"<div class='metric-card'>"
         f"<b>Suggested Action: </b>"
         f"<span style='color:{action_colour};font-weight:700;"
-        f"font-size:1.1em'>{action}</span><br><br>"
+        f"font-size:1.1em'>{action}</span>"
+        f"<span style='color:#9ca3af'> ({action_reason})</span><br><br>"
         f"<b>Stop-Loss Level ({stop_loss_pct*100:.0f}%):</b> "
         f"RM {sl_info['threshold']:.4f}<br>"
         f"<span style='color:{sl_colour}'>{sl_info['advisory']}</span>"

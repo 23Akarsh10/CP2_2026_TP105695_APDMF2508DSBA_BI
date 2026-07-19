@@ -123,6 +123,8 @@ class EngineConfig:
     )
     max_headlines: int = 8
     fuzzy_threshold: float = 0.82
+    rss_timeout: int = 8       # seconds, per feed, per attempt
+    rss_retries: int = 1       # extra attempts after the first on failure
     ollama_model: str = "llama3"
     ollama_base_url: str = "http://localhost:11434"
     macro_provider: Optional[Callable] = None
@@ -789,20 +791,59 @@ def _headline_matches(title, company_name, threshold, aliases=None):
     return any(_fuzzy_contains(title_lower, term, threshold) for term in _aliases_for(company_name, aliases))
 
 
-def fetch_company_headlines(company_name, max_headlines=None, config=CONFIG, aliases=None):
+_rss_logger = logging.getLogger("rss_feeds")
+
+
+def _fetch_feed(url, config=CONFIG):
+    """
+    Fetches and parses one RSS feed with an explicit timeout and a
+    configurable number of retries. Feedparser's own .parse(url) has
+    no timeout and can hang or fail silently on a transient network
+    blip, which was the cause of headlines intermittently coming back
+    empty on the first run and then appearing a few minutes later.
+
+    Returns the parsed feed, or None if every attempt failed - and
+    logs a warning (rather than silently swallowing the failure) so
+    a genuinely quiet news day is distinguishable from a feed outage.
+    """
+    last_exc = None
+    attempts = config.rss_retries + 1
+    for attempt in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=config.rss_timeout) as resp:
+                raw = resp.read()
+            return feedparser.parse(raw)
+        except Exception as exc:
+            last_exc = exc
+            continue
+    _rss_logger.warning(
+        "RSS feed unreachable after %d attempt(s): %s (%s)",
+        attempts, url, last_exc)
+    return None
+
+
+def fetch_company_headlines(company_name, max_headlines=None, config=CONFIG,
+                             aliases=None, failed_feeds=None):
+    """
+    failed_feeds: optional list. If provided, any feed URL that could
+    not be fetched after all retries is appended to it, so callers can
+    distinguish "no headlines matched" from "some feeds were down".
+    """
     max_headlines = max_headlines or config.max_headlines
     matched = []
     if not _HAS_FEEDPARSER:
         return matched
     for url in config.rss_feeds:
-        try:
-            parsed = feedparser.parse(url)
-            for entry in parsed.entries:
-                title = entry.get("title", "").strip()
-                if title and _headline_matches(title, company_name, config.fuzzy_threshold, aliases):
-                    matched.append(title)
-        except Exception:
+        parsed = _fetch_feed(url, config)
+        if parsed is None:
+            if failed_feeds is not None:
+                failed_feeds.append(url)
             continue
+        for entry in parsed.entries:
+            title = entry.get("title", "").strip()
+            if title and _headline_matches(title, company_name, config.fuzzy_threshold, aliases):
+                matched.append(title)
     return matched[:max_headlines]
 
 
@@ -861,7 +902,13 @@ def bnm_macro_provider(timeout=10, cpi_fn=None, gdp_fn=None):
 
 
 def build_agent_context(company_name, config=CONFIG):
-    return {"headlines": fetch_company_headlines(company_name, config=config), "macro": get_macro_indicators(config)}
+    failed_feeds = []
+    headlines = fetch_company_headlines(company_name, config=config, failed_feeds=failed_feeds)
+    return {
+        "headlines": headlines,
+        "macro": get_macro_indicators(config),
+        "failed_feeds": failed_feeds,
+    }
 
 
 def _extract_json(raw_text):
@@ -871,8 +918,14 @@ def _extract_json(raw_text):
     return json.loads(match.group())
 
 
-def _default_neutral_response():
-    msg = "No recent news or macroeconomic coverage available."
+def _default_neutral_response(failed_feeds=None):
+    if failed_feeds:
+        msg = (f"No sentiment available: {len(failed_feeds)} of "
+               f"{len(CONFIG.rss_feeds)} news feed(s) could not be "
+               f"reached this run. This is usually transient - try "
+               f"again shortly.")
+    else:
+        msg = "No recent news or macroeconomic coverage available."
     return {"sentiment_label": "Neutral", "macro_impact": msg, "qualitative_rationale": msg}
 
 
@@ -919,8 +972,9 @@ def run_sentiment_agent(ticker, company_name, config=CONFIG):
         return _default_neutral_response()
     headlines = context["headlines"]
     macro = context["macro"]
+    failed_feeds = context.get("failed_feeds", [])
     if not headlines:
-        return _default_neutral_response()
+        return _default_neutral_response(failed_feeds)
     headline_block = "\n".join(f"- {h}" for h in headlines)
     # The label is asked for LAST and explicitly tied to the rationale,
     # rather than as an independent field the model can fill in without
