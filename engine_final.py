@@ -103,21 +103,22 @@ class EngineConfig:
     range_lookback: int = 20
     stop_pct: float = 0.05
     rss_feeds: tuple = (
-        # 1. The Edge Malaysia — Malaysia's leading financial news
-        # organisation. Covers Bursa Malaysia, corporates, economics.
-        # Primary source for market-moving business news.
-        "https://www.theedgemalaysia.com/rss.html",
-        # 2. Bernama — Malaysia's official national news agency.
+        # NOTE: The Edge Malaysia's old feed (theedgemalaysia.com/rss.html)
+        # was removed - that domain was consolidated into theedgemarkets.com
+        # years ago and the URL now 404s. No live replacement RSS feed
+        # could be found for The Edge Markets as of this writing (their
+        # legacy feeds.theedgemarkets.com endpoint returns 0 entries).
+        # 1. Bernama — Malaysia's official national news agency.
         # Authoritative source for government, economic and
         # corporate announcements.
         "https://www.bernama.com/en/rssfeed.php",
-        # 3. Free Malaysia Today — independent bilingual (English/BM)
+        # 2. Free Malaysia Today — independent bilingual (English/BM)
         # outlet. Covers business and economic policy news.
         "https://www.freemalaysiatoday.com/feeds/rss/headlines/",
-        # 4. Malay Mail — established Malaysian daily, fully digital
+        # 3. Malay Mail — established Malaysian daily, fully digital
         # since 2018. Covers local business and market news.
         "https://www.malaymail.com/feed/rss/malaysia",
-        # 5. The Sun Malaysia — independent English daily with
+        # 4. The Sun Malaysia — independent English daily with
         # dedicated business coverage of Bursa-listed companies.
         "https://thesun.my/feed/",
     )
